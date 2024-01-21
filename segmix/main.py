@@ -368,7 +368,7 @@ class SegMixPipeline:
                     self.config["base_model"],
                     torch_dtype=self.torch_dtype,
                 )
-
+        self.pipe._name_or_path = "SegMix"
         # TODO: Add Support for Scheduler Selection
         self.pipe.scheduler = DDPMScheduler.from_config(self.pipe.scheduler.config)
 
