@@ -312,9 +312,13 @@ class SegMixPipeline:
         if os.path.isfile(config_or_path):
             self.load_from_scratch(config_or_path, **kwargs)
         else:
-            unet = self.create_empty(config_or_path)
+            if not os.path.isdir(config_or_path):
+                cached_folder = StableDiffusionXLPipeline.download(config_or_path)
+            else:
+                cached_folder = config_or_path
+            unet = self.create_empty(cached_folder)
             unet.load_state_dict(safetensors.torch.load_file(f'{config_or_path}/unet/diffusion_pytorch_model.safetensors'))
-            self.pipe = StableDiffusionXLPipeline.from_pretrained(config_or_path, unet = unet, torch_dtype=self.torch_dtype, use_safetensors=self.use_safetensors)
+            self.pipe = StableDiffusionXLPipeline.from_pretrained(cached_folder, unet = unet, torch_dtype=self.torch_dtype, use_safetensors=self.use_safetensors)
             self.pipe.to(self.device)
             self.pipe.unet.to(
                 device=self.device,
@@ -368,7 +372,7 @@ class SegMixPipeline:
                     self.config["base_model"],
                     torch_dtype=self.torch_dtype,
                 )
-        self.pipe._name_or_path = "SegMix"
+
         # TODO: Add Support for Scheduler Selection
         self.pipe.scheduler = DDPMScheduler.from_config(self.pipe.scheduler.config)
 
@@ -559,7 +563,7 @@ class SegMixPipeline:
                                 .ff.parameters()
                             ).size()[-1],
                             "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(self.config["experts"]),
+                            "num_local_experts": len(experts),
                         }
                         # FF Layers
                         layers = []
@@ -582,7 +586,7 @@ class SegMixPipeline:
                             .transformer_blocks[k]
                             .attn1.to_q.weight.size()[-1],
                             "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(self.config["experts"]),
+                            "num_local_experts": self.num_experts,
                         }
                         layers = []
                         for l in range(len(experts)):
@@ -629,7 +633,7 @@ class SegMixPipeline:
                             .transformer_blocks[k]
                             .attn2.to_q.weight.size()[-1],
                             "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(self.config["experts"]),
+                            "num_local_experts": len(experts),
                         }
 
                         layers = []
@@ -651,7 +655,7 @@ class SegMixPipeline:
                             .transformer_blocks[k]
                             .attn2.to_k.weight.size()[-1],
                             "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(self.config["experts"]),
+                            "num_local_experts": len(experts),
                             "out_dim": self.pipe.unet.down_blocks[i]
                             .attentions[j]
                             .transformer_blocks[k]
@@ -680,7 +684,7 @@ class SegMixPipeline:
                             .transformer_blocks[k]
                             .attn2.to_v.weight.size()[0],
                             "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(self.config["experts"]),
+                            "num_local_experts": len(experts),
                         }
                         layers = []
                         for l in range(len(experts)):
@@ -709,7 +713,7 @@ class SegMixPipeline:
                                 .ff.parameters()
                             ).size()[-1],
                             "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(self.config["experts"]),
+                            "num_local_experts": len(experts),
                         }
                         # FF Layers
                         layers = []
@@ -733,7 +737,7 @@ class SegMixPipeline:
                             .transformer_blocks[k]
                             .attn1.to_q.weight.size()[-1],
                             "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(self.config["experts"]),
+                            "num_local_experts": len(experts),
                         }
 
                         layers = []
@@ -756,7 +760,7 @@ class SegMixPipeline:
                             .transformer_blocks[k]
                             .attn1.to_k.weight.size()[-1],
                             "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(self.config["experts"]),
+                            "num_local_experts": len(experts),
                         }
                         layers = []
 
@@ -779,7 +783,7 @@ class SegMixPipeline:
                             .transformer_blocks[k]
                             .attn1.to_v.weight.size()[-1],
                             "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(self.config["experts"]),
+                            "num_local_experts": len(experts),
                         }
                         layers = []
 
@@ -802,7 +806,7 @@ class SegMixPipeline:
                             .transformer_blocks[k]
                             .attn2.to_q.weight.size()[-1],
                             "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(self.config["experts"]),
+                            "num_local_experts": len(experts),
                         }
                         layers = []
 
@@ -829,7 +833,7 @@ class SegMixPipeline:
                             .transformer_blocks[k]
                             .attn2.to_k.weight.size()[0],
                             "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(self.config["experts"]),
+                            "num_local_experts": len(experts),
                         }
 
                         layers = []
@@ -857,7 +861,7 @@ class SegMixPipeline:
                             .transformer_blocks[k]
                             .attn2.to_v.weight.size()[0],
                             "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(self.config["experts"]),
+                            "num_local_experts": len(experts),
                         }
                         layers = []
 
@@ -986,10 +990,10 @@ class SegMixPipeline:
         return self.pipe(*args, **kwds)
     
     def create_empty(self, path):
-        with open(f"{path}/unet/segmix_config.json") as f:
+        with open(f"{path}/unet/config.json") as f:
             config = json.load(f)
-        self.config = config
-        unet = UNet2DConditionModel.from_config(f"{path}/unet")
+        self.config = config["segmix_config"]
+        unet = UNet2DConditionModel.from_config(config)
         num_experts_per_tok = config["num_experts_per_tok"]
         num_experts = config["num_experts"]
         moe_layers = config["moe_layers"]
@@ -1233,15 +1237,10 @@ class SegMixPipeline:
         return unet
 
     def save_pretrained(self, path):
-        try:
-            self.pipe.save_pretrained(path)
-        except:
-            pass
-        file=self.pipe.unet.state_dict()
-        for i in file:
-            file[i]=file[i].contiguous()
-        safetensors.torch.save_file(file,f'{path}/unet/diffusion_pytorch_model.safetensors')
-        with open(f"{path}/unet/segmix_config.json", "w") as f:
-            f.write(json.dumps(self.config))
+        for param in self.pipe.unet.parameters():
+            param.data = param.data.contiguous()
+        self.pipe.config["segmix_config"] = self.config
+        self.pipe.save_pretrained(path)
+        safetensors.torch.save_file(self.pipe.unet.state_dict(),f'{path}/unet/diffusion_pytorch_model.safetensors')
 
     

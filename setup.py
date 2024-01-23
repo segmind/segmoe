@@ -8,10 +8,13 @@ long_description = (this_directory / "README.md").read_text()
 setup(name='segmix',
       version='0.0.1',
       description='Package for Mixing Stable Diffusiion XL Models by Segmind',
-      url='https://www.segmind.com/models',
-      author='Segmind',
+      url='https://github.com/segmind/segmix',
+      author='Yatharth Gupta',
       license='MIT',
       packages=['segmix'],
+      entry_points = {
+        'console_scripts': ['segmix=segmix.cli:create'],
+    },
       author_email='yatharthg@segmind.com',
       install_requires=[
           'torch>=2.0.0',
