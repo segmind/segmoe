@@ -1,19 +1,19 @@
-# SegMix: Segmind Mixture of Experts
+# SegMoE: Segmind Mixture of Experts
 
 A Framework to combine multiple Stable Diffusion XL models into a mixture of experts model. Functions simialar to [mergekit](https://github.com/cg123/mergekit)'s mixtral branch but for Stable Diffusion XL models.
 
 ## Installation
 
 ```bash
-pip install segmix
+pip install segmoe
 ```
 
 ## Usage
 
 ```python
-from segmix import SegMixPipeline
+from segmoe import SegMoEPipeline
 
-pipeline = SegMixPipeline("segmind/SegMix-v0", device = "cuda")
+pipeline = SegMoEPipeline("segmind/SegMoE-v0", device = "cuda")
 
 prompt = "cosmic canvas,  orange city background, painting of a chubby cat"
 negative_prompt = "nsfw, bad quality, worse quality"
@@ -59,10 +59,10 @@ Both Huggingface Models and CivitAI Models are supported. For CivitAI models, pa
 Then run the following command:
 
 ```bash
-segmix config.yaml segmix_v0
+segmoe config.yaml segmoe_v0
 ```
 
-This will create a folder called segmix_v0 with the following structure:
+This will create a folder called segmoe_v0 with the following structure:
 
 ```bash
 ├── model_index.json
@@ -86,8 +86,7 @@ This will create a folder called segmix_v0 with the following structure:
 │   └── vocab.json
 ├── unet
 │   ├── config.json
-│   ├── diffusion_pytorch_model.safetensors
-│   └── segmix_config.json
+│   └── diffusion_pytorch_model.safetensors
 └──vae
     ├── config.json
     └── diffusion_pytorch_model.safetensors
@@ -97,11 +96,11 @@ Alternatively, you can also use the following command to create a mixture of exp
 
 ```python
 
-from segmix import SegMixPipeline
+from segmoe import SegMoEPipeline
 
-pipeline = SegMixPipeline("config.yaml", device="cuda")
+pipeline = SegMoEPipeline("config.yaml", device="cuda")
 
-pipeline.save_pretrained("segmix_v0")
+pipeline.save_pretrained("segmoe_v0")
 ```
 
 ## Advantages
@@ -114,7 +113,7 @@ pipeline.save_pretrained("segmix_v0")
 + The framework is not yet optimized for memory usage.
 
 ## Research Roadmap
-- [ ] Optimize for Speed
+- [*] Optimize for Speed
 - [ ] Optimize for Memory Usage
 - [ ] Add Support for LoRAs
 - [ ] Add Support for More Models
@@ -141,12 +140,12 @@ The experts are the models that will be used to generate the final image. Each e
 ## Citation
 
 ```bibtex
-@misc{segmix,
+@misc{segmoe,
   author = {Yatharth Gupta, Vishnu V Jaddipal, Harish Prabhala},
-  title = {SegMix: Segmind Mixture of Experts},
+  title = {SegMoE: Segmind Mixture of Experts},
   year = {2024},
   publisher = {GitHub},
   journal = {GitHub repository},
-  howpublished = {\url{https://github.com/segmind/segmix}}
+  howpublished = {\url{https://github.com/segmind/segmoe}}
 }
 ```

@@ -35,132 +35,42 @@ class SparseMoeBlock(nn.Module):
         self.hidden_dim = config["hidden_size"]
         self.num_experts = config["num_local_experts"]
         self.top_k = config["num_experts_per_tok"]
+        self.out_dim = config.get("out_dim",self.hidden_dim)
 
         # gating
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-        self.experts = nn.ModuleList([copy_model(exp) for exp in experts])
+        self.experts = nn.ModuleList([deepcopy(exp) for exp in experts])
 
     def forward(self, hidden_states: torch.Tensor, scale) -> torch.Tensor:
         batch_size, sequence_length, f_map_sz = hidden_states.shape
         hidden_states = hidden_states.view(-1, f_map_sz)
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
+        _,selected_experts=torch.topk(router_logits.sum(dim=0,keepdim=True),self.top_k,dim=1)
+        routing_weights=F.softmax(router_logits[:,selected_experts[0]], dim=1, dtype=torch.float)
 
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1
-        )
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
 
-        final_hidden_states = torch.zeros(
-            (batch_size * sequence_length, f_map_sz),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(
-            selected_experts, num_classes=self.num_experts
-        ).permute(2, 1, 0)
-
-        # Loop over all available experts in the model and perform the computation on each expert
-        for expert_idx in range(self.num_experts):
-            expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx])
-
-            if top_x.shape[0] == 0:
-                continue
-
-            # in torch it is faster to index using lists than torch tensors
-            top_x_list = top_x.tolist()
-            idx_list = idx.tolist()
-
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x_list].reshape(-1, f_map_sz)
-            current_hidden_states = (
-                expert_layer(current_state)
-                * routing_weights[top_x_list, idx_list, None]
-            )
-
-            # However `index_add_` only support torch tensors for indexing so we'll use
-            # the `top_x` tensor here.
-            final_hidden_states.index_add_(
-                0, top_x, current_hidden_states.to(hidden_states.dtype)
-            )
-        final_hidden_states = final_hidden_states.reshape(
-            batch_size, sequence_length, f_map_sz
-        )
-        return final_hidden_states
-
-class SparseMoeAsymBlock(nn.Module):
-    def __init__(self, config, experts):
-        super().__init__()
-        self.hidden_dim = config["hidden_size"]
-        self.out_dim = config["out_dim"]
-        self.num_experts = config["num_local_experts"]
-        self.top_k = config["num_experts_per_tok"]
-
-        # gating
-        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-        self.experts = nn.ModuleList([copy_model(exp) for exp in experts])
-
-    def forward(self, hidden_states: torch.Tensor, scale) -> torch.Tensor:
-        batch_size, sequence_length, f_map_sz = hidden_states.shape
-        hidden_states = hidden_states.view(-1, f_map_sz)
-        # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.gate(hidden_states)
-
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(
-            routing_weights, self.top_k, dim=-1
-        )
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        # we cast back to the input dtype
-        routing_weights = routing_weights.to(hidden_states.dtype)
         final_hidden_states = torch.zeros(
             (batch_size * sequence_length, self.out_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
 
-        # One hot encode the selected experts to create an expert mask
-        # this will be used to easily index which expert is going to be sollicitated
-        expert_mask = torch.nn.functional.one_hot(
-            selected_experts, num_classes=self.num_experts
-        ).permute(2, 1, 0)
+
 
         # Loop over all available experts in the model and perform the computation on each expert
-        for expert_idx in range(self.num_experts):
+        for i,expert_idx in enumerate(selected_experts[0].tolist()):
             expert_layer = self.experts[expert_idx]
-            idx, top_x = torch.where(expert_mask[expert_idx])
 
-            if top_x.shape[0] == 0:
-                continue
+            current_hidden_states = routing_weights[:,i].view(batch_size*sequence_length,-1)*expert_layer(hidden_states)
 
-            # in torch it is faster to index using lists than torch tensors
-            top_x_list = top_x.tolist()
-            idx_list = idx.tolist()
-
-            # Index the correct hidden states and compute the expert hidden state for
-            # the current expert. We need to make sure to multiply the output hidden
-            # states by `routing_weights` on the corresponding tokens (top-1 and top-2)
-            current_state = hidden_states[None, top_x_list].reshape(-1, f_map_sz)
-
-            current_hidden_states = (
-                expert_layer(current_state)
-                * routing_weights[top_x_list, idx_list, None]
-            )
 
             # However `index_add_` only support torch tensors for indexing so we'll use
             # the `top_x` tensor here.
-            final_hidden_states.index_add_(
-                0, top_x, current_hidden_states.to(hidden_states.dtype)
-            )
+            final_hidden_states = final_hidden_states + current_hidden_states
         final_hidden_states = final_hidden_states.reshape(
             batch_size, sequence_length, self.out_dim
         )
@@ -303,7 +213,7 @@ def get_gate_params(
 
     return gate_vects
 
-class SegMixPipeline:
+class SegMoEPipeline:
     def __init__(self, config_or_path, **kwargs) -> Any:
         self.torch_dtype = kwargs.pop("torch_dtype", torch.float16)
         self.use_safetensors = kwargs.pop("use_safetensors", True)
@@ -672,7 +582,7 @@ class SegMixPipeline:
                             )
                         self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
-                        ].attn2.to_k = SparseMoeAsymBlock(config, layers)
+                        ].attn2.to_k = SparseMoeBlock(config, layers)
 
                         config = {
                             "hidden_size": self.pipe.unet.down_blocks[i]
@@ -697,7 +607,7 @@ class SegMixPipeline:
                             )
                         self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
-                        ].attn2.to_v = SparseMoeAsymBlock(config, layers)
+                        ].attn2.to_v = SparseMoeBlock(config, layers)
 
         for i in range(len(self.pipe.unet.up_blocks) - 1):
             for j in range(len(self.pipe.unet.up_blocks[i].attentions)):
@@ -849,7 +759,7 @@ class SegMixPipeline:
 
                         self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
                             k
-                        ].attn2.to_k = SparseMoeAsymBlock(config, layers)
+                        ].attn2.to_k = SparseMoeBlock(config, layers)
 
                         config = {
                             "hidden_size": self.pipe.unet.up_blocks[i]
@@ -876,7 +786,7 @@ class SegMixPipeline:
 
                         self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
                             k
-                        ].attn2.to_v = SparseMoeAsymBlock(config, layers)
+                        ].attn2.to_v = SparseMoeBlock(config, layers)
 
         # Routing Weight Initialization
         if self.config.get("init", "hidden") == "hidden":
@@ -1083,7 +993,7 @@ class SegMixPipeline:
                         ].attn2.to_k] * num_experts
                         unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
-                        ].attn2.to_k = SparseMoeAsymBlock(config, layers)
+                        ].attn2.to_k = SparseMoeBlock(config, layers)
 
                         config = {
                             "hidden_size": unet.down_blocks[i]
@@ -1102,7 +1012,7 @@ class SegMixPipeline:
                         ].attn2.to_v] * num_experts
                         unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
-                        ].attn2.to_v = SparseMoeAsymBlock(config, layers)
+                        ].attn2.to_v = SparseMoeBlock(config, layers)
         for i in range(len(unet.up_blocks) - 1):
             for j in range(len(unet.up_blocks[i].attentions)):
                 for k in range(
@@ -1213,7 +1123,7 @@ class SegMixPipeline:
 
                         unet.up_blocks[i].attentions[j].transformer_blocks[
                             k
-                        ].attn2.to_k = SparseMoeAsymBlock(config, layers)
+                        ].attn2.to_k = SparseMoeBlock(config, layers)
 
                         config = {
                             "hidden_size": unet.up_blocks[i]
@@ -1233,7 +1143,7 @@ class SegMixPipeline:
 
                         unet.up_blocks[i].attentions[j].transformer_blocks[
                             k
-                        ].attn2.to_v = SparseMoeAsymBlock(config, layers)
+                        ].attn2.to_v = SparseMoeBlock(config, layers)
         return unet
 
     def save_pretrained(self, path):

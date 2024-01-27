@@ -5,15 +5,15 @@ from pathlib import Path
 this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text()
 
-setup(name='segmix',
+setup(name='segmoe',
       version='0.0.1',
       description='Package for Mixing Stable Diffusiion XL Models by Segmind',
-      url='https://github.com/segmind/segmix',
+      url='https://github.com/segmind/segmoe',
       author='Yatharth Gupta',
       license='MIT',
-      packages=['segmix'],
+      packages=['segmoe'],
       entry_points = {
-        'console_scripts': ['segmix=segmix.cli:create'],
+        'console_scripts': ['segmoe=segmoe.cli:create'],
     },
       author_email='yatharthg@segmind.com',
       install_requires=[
