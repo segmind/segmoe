@@ -1,6 +1,6 @@
 # SegMoE: Segmind Mixture of Experts
 
-A Framework to combine multiple Stable Diffusion XL models into a mixture of experts model. Functions simialar to [mergekit](https://github.com/cg123/mergekit)'s mixtral branch but for Stable Diffusion XL models.
+A Framework to combine multiple Stable Diffusion XL models into a mixture of experts model. Functions similar to [mergekit](https://github.com/cg123/mergekit)'s mixtral branch but for Stable Diffusion XL models.
 
 ## Installation
 
