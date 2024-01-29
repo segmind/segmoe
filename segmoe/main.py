@@ -4,6 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from diffusers import (
+    DiffusionPipeline,
+    StableDiffusionPipeline,
     StableDiffusionXLPipeline,
     DDPMScheduler,
     UNet2DConditionModel,
@@ -25,9 +27,6 @@ def remove_all_forward_hooks(model: torch.nn.Module) -> None:
             if hasattr(child, "_forward_hooks"):
                 child._forward_hooks: Dict[int, Callable] = OrderedDict()
             remove_all_forward_hooks(child)
-
-def copy_model(model):
-    return pickle.loads(pickle.dumps(model))
 
 class SparseMoeBlock(nn.Module):
     def __init__(self, config, experts):
@@ -81,138 +80,6 @@ def getActivation(activation, name):
         activation[name] = inp
     return hook
 
-def cast_hook(pipe, dicts):
-    for i in range(1, len(pipe.unet.down_blocks)):
-        for j in range(len(pipe.unet.down_blocks[i].attentions)):
-            for k in range(
-                len(pipe.unet.down_blocks[i].attentions[j].transformer_blocks)
-            ):
-                pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                    k
-                ].ff.register_forward_hook(getActivation(dicts, f"d{i}a{j}t{k}"))
-
-                ## Down Self Attns
-                pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                    k
-                ].attn1.to_q.register_forward_hook(
-                    getActivation(dicts, f"sattnqd{i}a{j}t{k}")
-                )
-                pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                    k
-                ].attn1.to_k.register_forward_hook(
-                    getActivation(dicts, f"sattnkd{i}a{j}t{k}")
-                )
-                pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                    k
-                ].attn1.to_v.register_forward_hook(
-                    getActivation(dicts, f"sattnvd{i}a{j}t{k}")
-                )
-
-                ## Down Cross Attns
-
-                pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                    k
-                ].attn2.to_q.register_forward_hook(
-                    getActivation(dicts, f"cattnqd{i}a{j}t{k}")
-                )
-                pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                    k
-                ].attn2.to_k.register_forward_hook(
-                    getActivation(dicts, f"cattnkd{i}a{j}t{k}")
-                )
-                pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                    k
-                ].attn2.to_v.register_forward_hook(
-                    getActivation(dicts, f"cattnvd{i}a{j}t{k}")
-                )
-
-    for i in range(len(pipe.unet.up_blocks) - 1):
-        for j in range(len(pipe.unet.up_blocks[i].attentions)):
-            for k in range(
-                len(pipe.unet.up_blocks[i].attentions[j].transformer_blocks)
-            ):
-                pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                    k
-                ].ff.register_forward_hook(getActivation(dicts, f"u{i}a{j}t{k}"))
-                ## Up Self Attns
-                pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                    k
-                ].attn1.to_q.register_forward_hook(
-                    getActivation(dicts, f"sattnqu{i}a{j}t{k}")
-                )
-                pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                    k
-                ].attn1.to_k.register_forward_hook(
-                    getActivation(dicts, f"sattnku{i}a{j}t{k}")
-                )
-                pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                    k
-                ].attn1.to_v.register_forward_hook(
-                    getActivation(dicts, f"sattnvu{i}a{j}t{k}")
-                )
-
-                ## Up Cross Attns
-                pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                    k
-                ].attn2.to_q.register_forward_hook(
-                    getActivation(dicts, f"cattnqu{i}a{j}t{k}")
-                )
-                pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                    k
-                ].attn2.to_k.register_forward_hook(
-                    getActivation(dicts, f"cattnku{i}a{j}t{k}")
-                )
-                pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                    k
-                ].attn2.to_v.register_forward_hook(
-                    getActivation(dicts, f"cattnvu{i}a{j}t{k}")
-                )
-
-def get_hidden_states(
-    model,
-    positive,
-    negative,
-    average: bool = True,
-):
-    intermediate = {}
-    cast_hook(model, intermediate)
-    with torch.no_grad():
-        _ = model(positive, negative_prompt=negative, num_inference_steps=25)
-    hidden = {}
-    for key in intermediate:
-        hidden_states = intermediate[key][0][-1]
-        if average:
-            # use average over sequence
-            hidden_states = hidden_states.sum(dim=0) / hidden_states.shape[0]
-        else:
-            # take last value
-            hidden_states = hidden_states[:-1]
-        hidden[key] = hidden_states
-    return hidden
-
-def get_gate_params(
-    experts,
-    positive,
-    negative,
-):
-    gate_vects = {}
-    for i, expert in enumerate(tqdm.tqdm(experts, desc="Expert Prompts")):
-        hidden_states = get_hidden_states(expert, positive[i], negative[i])
-        for h in hidden_states:
-            if i == 0:
-                gate_vects[h] = []
-            hidden_states[h] /= (
-                hidden_states[h].norm(p=2, dim=-1, keepdim=True).clamp(min=1e-8)
-            )
-            gate_vects[h].append(hidden_states[h])
-    for h in hidden_states:
-        gate_vects[h] = torch.stack(
-            gate_vects[h], dim=0
-        )  # (num_expert, num_layer, hidden_size)
-        gate_vects[h].permute(1, 0)
-
-    return gate_vects
-
 class SegMoEPipeline:
     def __init__(self, config_or_path, **kwargs) -> Any:
         self.torch_dtype = kwargs.pop("torch_dtype", torch.float16)
@@ -223,18 +90,19 @@ class SegMoEPipeline:
             self.load_from_scratch(config_or_path, **kwargs)
         else:
             if not os.path.isdir(config_or_path):
-                cached_folder = StableDiffusionXLPipeline.download(config_or_path)
+                cached_folder = DiffusionPipeline.download(config_or_path)
             else:
                 cached_folder = config_or_path
             unet = self.create_empty(cached_folder)
-            unet.load_state_dict(safetensors.torch.load_file(f'{config_or_path}/unet/diffusion_pytorch_model.safetensors'))
-            self.pipe = StableDiffusionXLPipeline.from_pretrained(cached_folder, unet = unet, torch_dtype=self.torch_dtype, use_safetensors=self.use_safetensors)
+            unet.load_state_dict(safetensors.torch.load_file(f'{cached_folder}/unet/diffusion_pytorch_model.safetensors'))
+            self.pipe = DiffusionPipeline.from_pretrained(cached_folder, unet = unet, torch_dtype=self.torch_dtype, use_safetensors=self.use_safetensors)
             self.pipe.to(self.device)
             self.pipe.unet.to(
                 device=self.device,
                 dtype=self.torch_dtype,
                 memory_format=torch.channels_last,
             )
+
     def load_from_scratch(self, config : str, **kwargs) -> None:
         
         # Load Config
@@ -266,33 +134,41 @@ class SegMoEPipeline:
                     + " --content-disposition"
                 )
             self.config["base_model"] = "base/model.safetensors"
-            self.pipe = StableDiffusionXLPipeline.from_single_file(
+            self.pipe = DiffusionPipeline.from_single_file(
                 self.config["base_model"], torch_dtype=self.torch_dtype
             )
         else:
             try:
-                self.pipe = StableDiffusionXLPipeline.from_pretrained(
+                self.pipe = DiffusionPipeline.from_pretrained(
                     self.config["base_model"],
                     torch_dtype=self.torch_dtype,
                     use_safetensors=self.use_safetensors,
                     variant=self.variant,
+                    **kwargs
                 )
             except:
-                self.pipe = StableDiffusionXLPipeline.from_pretrained(
+                self.pipe = DiffusionPipeline.from_pretrained(
                     self.config["base_model"],
                     torch_dtype=self.torch_dtype,
+                    **kwargs
                 )
+        if self.pipe.__class__ == StableDiffusionPipeline:
+            self.up_idx_start = 1
+            self.up_idx_end = len(self.pipe.unet.up_blocks)
+            self.down_idx_start = 0
+            self.down_idx_end = len(self.pipe.unet.down_blocks) - 1
+        elif self.pipe.__class__ == StableDiffusionXLPipeline:
+            self.up_idx_start = 0
+            self.up_idx_end = len(self.pipe.unet.up_blocks) - 1
+            self.down_idx_start = 1
+            self.down_idx_end = len(self.pipe.unet.down_blocks)
+        self.config["up_idx_start"] = self.up_idx_start
+        self.config["up_idx_en"] = self.up_idx_end
+        self.config["down_idx_start"] = self.down_idx_start
+        self.config["down_idx_start"] = self.down_idx_end
 
         # TODO: Add Support for Scheduler Selection
         self.pipe.scheduler = DDPMScheduler.from_config(self.pipe.scheduler.config)
-
-        # Move Model to Device
-        self.pipe.to(self.device)
-        self.pipe.unet.to(
-            device=self.device,
-            dtype=self.torch_dtype,
-            memory_format=torch.channels_last,
-        )
 
         # Load Experts
         experts = []
@@ -315,7 +191,7 @@ class SegMoEPipeline:
                                     + " --content-disposition"
                                 )
                         exp["source_model"] = f"expert_{i}/model.safetensors"
-                        expert = StableDiffusionXLPipeline.from_single_file(
+                        expert = DiffusionPipeline.from_single_file(
                             exp["source_model"],
                         ).to(self.device, self.torch_dtype)
                     except Exception as e:
@@ -325,37 +201,26 @@ class SegMoEPipeline:
                         )
                 else:
                     try:
-                        expert = StableDiffusionXLPipeline.from_pretrained(
+                        expert = DiffusionPipeline.from_pretrained(
                             exp["source_model"],
                             torch_dtype=self.torch_dtype,
                             use_safetensors=self.use_safetensors,
                             variant=self.variant,
+                            **kwargs
                         )
 
                         # TODO: Add Support for Scheduler Selection
                         expert.scheduler = DDPMScheduler.from_config(
                             expert.scheduler.config
                         )
-
-                        expert.to(self.device)
-                        expert.unet.to(
-                            device=self.device,
-                            dtype=self.torch_dtype,
-                            memory_format=torch.channels_last,
-                        )
                     except:
-                        expert = StableDiffusionXLPipeline.from_pretrained(
+                        expert = DiffusionPipeline.from_pretrained(
                             exp["source_model"],
                             torch_dtype=self.torch_dtype,
+                            **kwargs
                         )
-                        expert.to(self.device)
                         expert.scheduler = DDPMScheduler.from_config(
                             expert.scheduler.config
-                        )
-                        expert.unet.to(
-                            device=self.device,
-                            dtype=self.torch_dtype,
-                            memory_format=torch.channels_last,
                         )
                 if exp.get("loras", None):
                     for j, lora in enumerate(exp["loras"]):
@@ -459,7 +324,7 @@ class SegMoEPipeline:
                         experts[j[i]].fuse_lora()
     
         # Replace FF and Attention Layers with Sparse MoE Layers
-        for i in range(1, len(self.pipe.unet.down_blocks)):
+        for i in range(self.down_idx_start, self.down_idx_end):
             for j in range(len(self.pipe.unet.down_blocks[i].attentions)):
                 for k in range(
                     len(self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks)
@@ -609,7 +474,7 @@ class SegMoEPipeline:
                             k
                         ].attn2.to_v = SparseMoeBlock(config, layers)
 
-        for i in range(len(self.pipe.unet.up_blocks) - 1):
+        for i in range(self.up_idx_start, self.up_idx_end):
             for j in range(len(self.pipe.unet.up_blocks[i].attentions)):
                 for k in range(
                     len(self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks)
@@ -790,8 +655,8 @@ class SegMoEPipeline:
 
         # Routing Weight Initialization
         if self.config.get("init", "hidden") == "hidden":
-            gate_params = get_gate_params(experts, positive, negative)
-            for i in range(1, len(self.pipe.unet.down_blocks)):
+            gate_params = self.get_gate_params(experts, positive, negative)
+            for i in range(self.down_idx_start, self.down_idx_end):
                 for j in range(len(self.pipe.unet.down_blocks[i].attentions)):
                     for k in range(
                         len(self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks)
@@ -840,7 +705,7 @@ class SegMoEPipeline:
                                 gate_params[f"cattnvd{i}a{j}t{k}"]
                             )
 
-            for i in range(len(self.pipe.unet.up_blocks) - 1):
+            for i in range(self.up_idx_start, self.up_idx_end):
                 for j in range(len(self.pipe.unet.up_blocks[i].attentions)):
                     for k in range(
                         len(self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks)
@@ -893,6 +758,13 @@ class SegMoEPipeline:
             del expert
         except:
             pass
+        # Move Model to Device
+        self.pipe.to(self.device)
+        self.pipe.unet.to(
+            device=self.device,
+            dtype=self.torch_dtype,
+            memory_format=torch.channels_last,
+        )
         gc.collect()
         torch.cuda.empty_cache()
     
@@ -902,12 +774,12 @@ class SegMoEPipeline:
     def create_empty(self, path):
         with open(f"{path}/unet/config.json") as f:
             config = json.load(f)
-        self.config = config["segmix_config"]
+        self.config = config["segmoe_config"]
         unet = UNet2DConditionModel.from_config(config)
-        num_experts_per_tok = config["num_experts_per_tok"]
-        num_experts = config["num_experts"]
-        moe_layers = config["moe_layers"]
-        for i in range(1, len(unet.down_blocks)):
+        num_experts_per_tok = self.config["num_experts_per_tok"]
+        num_experts = self.config["num_experts"]
+        moe_layers = self.config["moe_layers"]
+        for i in range(self.down_idx_start, self.down_idx_end):
             for j in range(len(unet.down_blocks[i].attentions)):
                 for k in range(
                     len(unet.down_blocks[i].attentions[j].transformer_blocks)
@@ -1013,7 +885,7 @@ class SegMoEPipeline:
                         unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
                         ].attn2.to_v = SparseMoeBlock(config, layers)
-        for i in range(len(unet.up_blocks) - 1):
+        for i in range(self.up_idx_start, self.up_idx_end):
             for j in range(len(unet.up_blocks[i].attentions)):
                 for k in range(
                     len(unet.up_blocks[i].attentions[j].transformer_blocks)
@@ -1149,8 +1021,149 @@ class SegMoEPipeline:
     def save_pretrained(self, path):
         for param in self.pipe.unet.parameters():
             param.data = param.data.contiguous()
-        self.pipe.config["segmix_config"] = self.config
+        self.pipe.unet.config["segmoe_config"] = self.config
         self.pipe.save_pretrained(path)
         safetensors.torch.save_file(self.pipe.unet.state_dict(),f'{path}/unet/diffusion_pytorch_model.safetensors')
 
+    def cast_hook(self, pipe, dicts):
+        for i in range(self.down_idx_start, self.down_idx_end):
+            for j in range(len(pipe.unet.down_blocks[i].attentions)):
+                for k in range(
+                    len(pipe.unet.down_blocks[i].attentions[j].transformer_blocks)
+                ):
+                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
+                        k
+                    ].ff.register_forward_hook(getActivation(dicts, f"d{i}a{j}t{k}"))
+
+                    ## Down Self Attns
+                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
+                        k
+                    ].attn1.to_q.register_forward_hook(
+                        getActivation(dicts, f"sattnqd{i}a{j}t{k}")
+                    )
+                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
+                        k
+                    ].attn1.to_k.register_forward_hook(
+                        getActivation(dicts, f"sattnkd{i}a{j}t{k}")
+                    )
+                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
+                        k
+                    ].attn1.to_v.register_forward_hook(
+                        getActivation(dicts, f"sattnvd{i}a{j}t{k}")
+                    )
+
+                    ## Down Cross Attns
+
+                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
+                        k
+                    ].attn2.to_q.register_forward_hook(
+                        getActivation(dicts, f"cattnqd{i}a{j}t{k}")
+                    )
+                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
+                        k
+                    ].attn2.to_k.register_forward_hook(
+                        getActivation(dicts, f"cattnkd{i}a{j}t{k}")
+                    )
+                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
+                        k
+                    ].attn2.to_v.register_forward_hook(
+                        getActivation(dicts, f"cattnvd{i}a{j}t{k}")
+                    )
+
+        for i in range(self.up_idx_start, self.up_idx_end):
+            for j in range(len(pipe.unet.up_blocks[i].attentions)):
+                for k in range(
+                    len(pipe.unet.up_blocks[i].attentions[j].transformer_blocks)
+                ):
+                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
+                        k
+                    ].ff.register_forward_hook(getActivation(dicts, f"u{i}a{j}t{k}"))
+                    ## Up Self Attns
+                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
+                        k
+                    ].attn1.to_q.register_forward_hook(
+                        getActivation(dicts, f"sattnqu{i}a{j}t{k}")
+                    )
+                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
+                        k
+                    ].attn1.to_k.register_forward_hook(
+                        getActivation(dicts, f"sattnku{i}a{j}t{k}")
+                    )
+                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
+                        k
+                    ].attn1.to_v.register_forward_hook(
+                        getActivation(dicts, f"sattnvu{i}a{j}t{k}")
+                    )
+
+                    ## Up Cross Attns
+                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
+                        k
+                    ].attn2.to_q.register_forward_hook(
+                        getActivation(dicts, f"cattnqu{i}a{j}t{k}")
+                    )
+                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
+                        k
+                    ].attn2.to_k.register_forward_hook(
+                        getActivation(dicts, f"cattnku{i}a{j}t{k}")
+                    )
+                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
+                        k
+                    ].attn2.to_v.register_forward_hook(
+                        getActivation(dicts, f"cattnvu{i}a{j}t{k}")
+                    )
+
+    @torch.no_grad
+    def get_hidden_states(self, model, positive, negative, average: bool = True):
+        intermediate = {}
+        self.cast_hook(model, intermediate)
+        with torch.no_grad():
+            _ = model(positive, negative_prompt=negative, num_inference_steps=25)
+        hidden = {}
+        for key in intermediate:
+            hidden_states = intermediate[key][0][-1]
+            if average:
+                # use average over sequence
+                hidden_states = hidden_states.sum(dim=0) / hidden_states.shape[0]
+            else:
+                # take last value
+                hidden_states = hidden_states[:-1]
+            hidden[key] = hidden_states.to(self.device)
+        del intermediate
+        gc.collect()
+        torch.cuda.empty_cache()
+        return hidden
+
+    @torch.no_grad
+    def get_gate_params(
+        self,
+        experts,
+        positive,
+        negative,
+    ):
+        gate_vects = {}
+        for i, expert in enumerate(tqdm.tqdm(experts, desc="Expert Prompts")):
+            expert.to(self.device)
+            expert.unet.to(
+                device=self.device,
+                dtype=self.torch_dtype,
+                memory_format=torch.channels_last,
+            )
+            hidden_states = self.get_hidden_states(expert, positive[i], negative[i])
+            del expert
+            gc.collect()
+            torch.cuda.empty_cache()
+            for h in hidden_states:
+                if i == 0:
+                    gate_vects[h] = []
+                hidden_states[h] /= (
+                    hidden_states[h].norm(p=2, dim=-1, keepdim=True).clamp(min=1e-8)
+                )
+                gate_vects[h].append(hidden_states[h])
+        for h in hidden_states:
+            gate_vects[h] = torch.stack(
+                gate_vects[h], dim=0
+            )  # (num_expert, num_layer, hidden_size)
+            gate_vects[h].permute(1, 0)
+
+        return gate_vects
     
