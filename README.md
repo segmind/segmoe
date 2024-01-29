@@ -39,6 +39,25 @@ img = pipeline(
 ).images[0]
 img.save("image.png")
 ```
+## Comparison 
+
+The Prompt Understanding seems to improve as shown in the images below. From Left to Right SegMoE-2x1-v0, SegMoE-4x2-v0, Base Model ([RealVisXL_V3.0](https://huggingface.co/SG161222/RealVisXL_V3.0))
+
+![image](https://github.com/segmind/segmoe/assets/95569637/bcdc1b11-bbf5-4947-b6bb-9f745ff0c040)
+
+<div align="center">three green glass bottles</div>
+<br>
+
+![image](https://github.com/segmind/segmoe/assets/95569637/d50e2af0-66d2-4112-aa88-bd4df88cbd5e)
+
+<div align="center">panda bear with aviator glasses on its head</div>
+<br>
+
+![image](https://github.com/segmind/segmoe/assets/95569637/aba2954a-80c2-428a-bf76-0a70a5e03e9b)
+
+<div align="center">the statue of Liberty next to the Washington Monument</div>
+
+
 
 ## Creating your Own Model
 
@@ -64,9 +83,7 @@ experts:
     negative_prompt: Negative Prompt for computing gate weights
 ```
 
-Example config can be found [here](./segmoe_config_4x2.yaml)
-
-For detailed information on how to create a config file, please refer to the [Config Parameters](#config-parameters)
+Any number of models can be combined, An Example config can be found [here](./segmoe_config_4x2.yaml). For detailed information on how to create a config file, please refer to the [Config Parameters](#config-parameters)
 
 **Note**
 Both Huggingface Models and CivitAI Models are supported. For CivitAI models, paste the download link of the model, For Example: "https://civitai.com/api/download/models/239306"
@@ -160,7 +177,7 @@ Stable Diffusion 1.5 Models are also supported and work natively. Example config
 + Model Can be upgraded by using a better finetuned model as one of the experts.
 
 ## Limitations
-+ Though the Model improves upon the fidelity of images as well as adherence, it does not drastically boost any particular model.
++ Though the Model improves upon the fidelity of images as well as adherence, it does not be drastically better than any one expert without training and relies on the knowledge of the experts.
 + This is not yet optimized for speed.
 + The framework is not yet optimized for memory usage.
 
