@@ -2,7 +2,6 @@ import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.activations import ACT2FN
 from diffusers import (
     DiffusionPipeline,
     StableDiffusionPipeline,
@@ -12,7 +11,6 @@ from diffusers import (
 )
 import tqdm
 import yaml
-import pickle
 from collections import OrderedDict
 from typing import Any, Dict, Callable
 import os
@@ -21,6 +19,7 @@ from math import ceil
 import json
 import safetensors
 
+
 def remove_all_forward_hooks(model: torch.nn.Module) -> None:
     for name, child in model._modules.items():
         if child is not None:
@@ -28,13 +27,15 @@ def remove_all_forward_hooks(model: torch.nn.Module) -> None:
                 child._forward_hooks: Dict[int, Callable] = OrderedDict()
             remove_all_forward_hooks(child)
 
+
+# Inspired from transformers.models.mixtral.modeling_mixtral.MixtralSparseMoeBlock
 class SparseMoeBlock(nn.Module):
     def __init__(self, config, experts):
         super().__init__()
         self.hidden_dim = config["hidden_size"]
         self.num_experts = config["num_local_experts"]
         self.top_k = config["num_experts_per_tok"]
-        self.out_dim = config.get("out_dim",self.hidden_dim)
+        self.out_dim = config.get("out_dim", self.hidden_dim)
 
         # gating
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
@@ -45,9 +46,12 @@ class SparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, f_map_sz)
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
-        _,selected_experts=torch.topk(router_logits.sum(dim=0,keepdim=True),self.top_k,dim=1)
-        routing_weights=F.softmax(router_logits[:,selected_experts[0]], dim=1, dtype=torch.float)
-
+        _, selected_experts = torch.topk(
+            router_logits.sum(dim=0, keepdim=True), self.top_k, dim=1
+        )
+        routing_weights = F.softmax(
+            router_logits[:, selected_experts[0]], dim=1, dtype=torch.float
+        )
 
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
@@ -58,14 +62,13 @@ class SparseMoeBlock(nn.Module):
             device=hidden_states.device,
         )
 
-
-
         # Loop over all available experts in the model and perform the computation on each expert
-        for i,expert_idx in enumerate(selected_experts[0].tolist()):
+        for i, expert_idx in enumerate(selected_experts[0].tolist()):
             expert_layer = self.experts[expert_idx]
 
-            current_hidden_states = routing_weights[:,i].view(batch_size*sequence_length,-1)*expert_layer(hidden_states)
-
+            current_hidden_states = routing_weights[:, i].view(
+                batch_size * sequence_length, -1
+            ) * expert_layer(hidden_states)
 
             # However `index_add_` only support torch tensors for indexing so we'll use
             # the `top_x` tensor here.
@@ -75,13 +78,34 @@ class SparseMoeBlock(nn.Module):
         )
         return final_hidden_states
 
+
 def getActivation(activation, name):
     def hook(model, inp, output):
         activation[name] = inp
+
     return hook
+
 
 class SegMoEPipeline:
     def __init__(self, config_or_path, **kwargs) -> Any:
+        """
+        Instantiates the SegMoEPipeline. SegMoEPipeline implements the Segmind Mixture of Diffusion Experts, efficiently combining Stable Diffusion and Stable Diffusion Xl models.
+
+        Usage:
+
+        from segmoe import SegMoEPipeline
+        pipeline = SegMoEPipeline(config_or_path, **kwargs)
+
+        config_or_path: Path to Config or Directory containing SegMoE checkpoint or HF Card of SegMoE Checkpoint.
+
+        Other Keyword Arguments:
+        torch_dtype: Data Type to load the pipeline in. (Default: torch.float16)
+        variant: Variant of the Model. (Default: fp16)
+        device: Device to load the model on. (Default: cuda)
+        Other args supported by diffusers.DiffusionPipeline are also supported.
+
+        For more details visit https://github.com/segmind/segmoe.
+        """
         self.torch_dtype = kwargs.pop("torch_dtype", torch.float16)
         self.use_safetensors = kwargs.pop("use_safetensors", True)
         self.variant = kwargs.pop("variant", "fp16")
@@ -94,8 +118,17 @@ class SegMoEPipeline:
             else:
                 cached_folder = config_or_path
             unet = self.create_empty(cached_folder)
-            unet.load_state_dict(safetensors.torch.load_file(f'{cached_folder}/unet/diffusion_pytorch_model.safetensors'))
-            self.pipe = DiffusionPipeline.from_pretrained(cached_folder, unet = unet, torch_dtype=self.torch_dtype, use_safetensors=self.use_safetensors)
+            unet.load_state_dict(
+                safetensors.torch.load_file(
+                    f"{cached_folder}/unet/diffusion_pytorch_model.safetensors"
+                )
+            )
+            self.pipe = DiffusionPipeline.from_pretrained(
+                cached_folder,
+                unet=unet,
+                torch_dtype=self.torch_dtype,
+                use_safetensors=self.use_safetensors,
+            )
             self.pipe.to(self.device)
             self.pipe.unet.to(
                 device=self.device,
@@ -103,8 +136,7 @@ class SegMoEPipeline:
                 memory_format=torch.channels_last,
             )
 
-    def load_from_scratch(self, config : str, **kwargs) -> None:
-        
+    def load_from_scratch(self, config: str, **kwargs) -> None:
         # Load Config
         with open(config, "r") as f:
             config = yaml.load(f, Loader=yaml.SafeLoader)
@@ -124,9 +156,11 @@ class SegMoEPipeline:
         moe_layers = self.config.get("moe_layers", "attn")
         self.config["moe_layers"] = moe_layers
         # Load Base Model
-        if self.config["base_model"].startswith("https://civitai.com/api/download/models/"):
+        if self.config["base_model"].startswith(
+            "https://civitai.com/api/download/models/"
+        ):
             os.makedirs("base", exist_ok=True)
-            if not os.path.isfile("base/model.safetensors"):                    
+            if not os.path.isfile("base/model.safetensors"):
                 os.system(
                     "wget -O "
                     + "base/model.safetensors"
@@ -144,13 +178,11 @@ class SegMoEPipeline:
                     torch_dtype=self.torch_dtype,
                     use_safetensors=self.use_safetensors,
                     variant=self.variant,
-                    **kwargs
+                    **kwargs,
                 )
             except:
                 self.pipe = DiffusionPipeline.from_pretrained(
-                    self.config["base_model"],
-                    torch_dtype=self.torch_dtype,
-                    **kwargs
+                    self.config["base_model"], torch_dtype=self.torch_dtype, **kwargs
                 )
         if self.pipe.__class__ == StableDiffusionPipeline:
             self.up_idx_start = 1
@@ -196,9 +228,7 @@ class SegMoEPipeline:
                         ).to(self.device, self.torch_dtype)
                     except Exception as e:
                         print(f"Expert {i} {exp['source_model']} failed to load")
-                        print(
-                            "Error:", e
-                        )
+                        print("Error:", e)
                 else:
                     try:
                         expert = DiffusionPipeline.from_pretrained(
@@ -206,7 +236,7 @@ class SegMoEPipeline:
                             torch_dtype=self.torch_dtype,
                             use_safetensors=self.use_safetensors,
                             variant=self.variant,
-                            **kwargs
+                            **kwargs,
                         )
 
                         # TODO: Add Support for Scheduler Selection
@@ -215,9 +245,7 @@ class SegMoEPipeline:
                         )
                     except:
                         expert = DiffusionPipeline.from_pretrained(
-                            exp["source_model"],
-                            torch_dtype=self.torch_dtype,
-                            **kwargs
+                            exp["source_model"], torch_dtype=self.torch_dtype, **kwargs
                         )
                         expert.scheduler = DDPMScheduler.from_config(
                             expert.scheduler.config
@@ -249,9 +277,7 @@ class SegMoEPipeline:
                                 print(
                                     f"Expert{i} LoRA {j} {lora['source_model']} failed to load"
                                 )
-                                print(
-                                    "Error:", e
-                                )
+                                print("Error:", e)
                         else:
                             expert.load_lora_weights(lora["source_model"])
                             if len(exp["loras"]) == 1:
@@ -281,9 +307,7 @@ class SegMoEPipeline:
                                 self.pipe.fuse_lora()
                         except Exception as e:
                             print(f"LoRA {i} {lora['source_model']} failed to load")
-                            print(
-                                "Error:", e
-                            )
+                            print("Error:", e)
                     else:
                         self.pipe.load_lora_weights(lora["source_model"])
                         if len(self.config["loras"]) == 1:
@@ -308,7 +332,9 @@ class SegMoEPipeline:
                     ):
                         try:
                             os.makedirs(f"lora_{i}", exist_ok=True)
-                            if not os.path.isfile(f"lora_{i}/pytorch_lora_weights.safetensors"):
+                            if not os.path.isfile(
+                                f"lora_{i}/pytorch_lora_weights.safetensors"
+                            ):
                                 os.system(
                                     f"wget {lora['source_model']} -O "
                                     + f"lora_{i}/pytorch_lora_weights.safetensors"
@@ -322,13 +348,13 @@ class SegMoEPipeline:
                     else:
                         experts[j[i]].load_lora_weights(lora["source_model"])
                         experts[j[i]].fuse_lora()
-    
+
         # Replace FF and Attention Layers with Sparse MoE Layers
         for i in range(self.down_idx_start, self.down_idx_end):
             for j in range(len(self.pipe.unet.down_blocks[i].attentions)):
                 for k in range(
                     len(self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks)
-                ):  
+                ):
                     if not moe_layers == "attn":
                         config = {
                             "hidden_size": next(
@@ -344,11 +370,13 @@ class SegMoEPipeline:
                         layers = []
                         for l in range(len(experts)):
                             layers.append(
-                                deepcopy(experts[l]
-                                .unet.down_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .ff)
+                                deepcopy(
+                                    experts[l]
+                                    .unet.down_blocks[i]
+                                    .attentions[j]
+                                    .transformer_blocks[k]
+                                    .ff
+                                )
                             )
                         self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
@@ -366,11 +394,13 @@ class SegMoEPipeline:
                         layers = []
                         for l in range(len(experts)):
                             layers.append(
-                                deepcopy(experts[l]
-                                .unet.down_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .attn1.to_q)
+                                deepcopy(
+                                    experts[l]
+                                    .unet.down_blocks[i]
+                                    .attentions[j]
+                                    .transformer_blocks[k]
+                                    .attn1.to_q
+                                )
                             )
                         self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
@@ -379,11 +409,13 @@ class SegMoEPipeline:
                         layers = []
                         for l in range(len(experts)):
                             layers.append(
-                                deepcopy(experts[l]
-                                .unet.down_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .attn1.to_k)
+                                deepcopy(
+                                    experts[l]
+                                    .unet.down_blocks[i]
+                                    .attentions[j]
+                                    .transformer_blocks[k]
+                                    .attn1.to_k
+                                )
                             )
                         self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
@@ -392,11 +424,13 @@ class SegMoEPipeline:
                         layers = []
                         for l in range(len(experts)):
                             layers.append(
-                                deepcopy(experts[l]
-                                .unet.down_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .attn1.to_v)
+                                deepcopy(
+                                    experts[l]
+                                    .unet.down_blocks[i]
+                                    .attentions[j]
+                                    .transformer_blocks[k]
+                                    .attn1.to_v
+                                )
                             )
                         self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
@@ -414,11 +448,13 @@ class SegMoEPipeline:
                         layers = []
                         for l in range(len(experts)):
                             layers.append(
-                                deepcopy(experts[l]
-                                .unet.down_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .attn2.to_q)
+                                deepcopy(
+                                    experts[l]
+                                    .unet.down_blocks[i]
+                                    .attentions[j]
+                                    .transformer_blocks[k]
+                                    .attn2.to_q
+                                )
                             )
                         self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
@@ -439,11 +475,13 @@ class SegMoEPipeline:
                         layers = []
                         for l in range(len(experts)):
                             layers.append(
-                                deepcopy(experts[l]
-                                .unet.down_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .attn2.to_k)
+                                deepcopy(
+                                    experts[l]
+                                    .unet.down_blocks[i]
+                                    .attentions[j]
+                                    .transformer_blocks[k]
+                                    .attn2.to_k
+                                )
                             )
                         self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
@@ -464,11 +502,13 @@ class SegMoEPipeline:
                         layers = []
                         for l in range(len(experts)):
                             layers.append(
-                                deepcopy(experts[l]
-                                .unet.down_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .attn2.to_v)
+                                deepcopy(
+                                    experts[l]
+                                    .unet.down_blocks[i]
+                                    .attentions[j]
+                                    .transformer_blocks[k]
+                                    .attn2.to_v
+                                )
                             )
                         self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
@@ -494,11 +534,13 @@ class SegMoEPipeline:
                         layers = []
                         for l in range(len(experts)):
                             layers.append(
-                                deepcopy(experts[l]
-                                .unet.up_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .ff)
+                                deepcopy(
+                                    experts[l]
+                                    .unet.up_blocks[i]
+                                    .attentions[j]
+                                    .transformer_blocks[k]
+                                    .ff
+                                )
                             )
                         self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
                             k
@@ -518,11 +560,13 @@ class SegMoEPipeline:
                         layers = []
                         for l in range(len(experts)):
                             layers.append(
-                                deepcopy(experts[l]
-                                .unet.up_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .attn1.to_q)
+                                deepcopy(
+                                    experts[l]
+                                    .unet.up_blocks[i]
+                                    .attentions[j]
+                                    .transformer_blocks[k]
+                                    .attn1.to_q
+                                )
                             )
 
                         self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
@@ -541,11 +585,13 @@ class SegMoEPipeline:
 
                         for l in range(len(experts)):
                             layers.append(
-                                deepcopy(experts[l]
-                                .unet.up_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .attn1.to_k)
+                                deepcopy(
+                                    experts[l]
+                                    .unet.up_blocks[i]
+                                    .attentions[j]
+                                    .transformer_blocks[k]
+                                    .attn1.to_k
+                                )
                             )
 
                         self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
@@ -564,11 +610,13 @@ class SegMoEPipeline:
 
                         for l in range(len(experts)):
                             layers.append(
-                                deepcopy(experts[l]
-                                .unet.up_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .attn1.to_v)
+                                deepcopy(
+                                    experts[l]
+                                    .unet.up_blocks[i]
+                                    .attentions[j]
+                                    .transformer_blocks[k]
+                                    .attn1.to_v
+                                )
                             )
 
                         self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
@@ -587,11 +635,13 @@ class SegMoEPipeline:
 
                         for l in range(len(experts)):
                             layers.append(
-                                deepcopy(experts[l]
-                                .unet.up_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .attn2.to_q)
+                                deepcopy(
+                                    experts[l]
+                                    .unet.up_blocks[i]
+                                    .attentions[j]
+                                    .transformer_blocks[k]
+                                    .attn2.to_q
+                                )
                             )
 
                         self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
@@ -615,11 +665,13 @@ class SegMoEPipeline:
 
                         for l in range(len(experts)):
                             layers.append(
-                                deepcopy(experts[l]
-                                .unet.up_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .attn2.to_k)
+                                deepcopy(
+                                    experts[l]
+                                    .unet.up_blocks[i]
+                                    .attentions[j]
+                                    .transformer_blocks[k]
+                                    .attn2.to_k
+                                )
                             )
 
                         self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
@@ -642,11 +694,13 @@ class SegMoEPipeline:
 
                         for l in range(len(experts)):
                             layers.append(
-                                deepcopy(experts[l]
-                                .unet.up_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .attn2.to_v)
+                                deepcopy(
+                                    experts[l]
+                                    .unet.up_blocks[i]
+                                    .attentions[j]
+                                    .transformer_blocks[k]
+                                    .attn2.to_v
+                                )
                             )
 
                         self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
@@ -659,47 +713,65 @@ class SegMoEPipeline:
             for i in range(self.down_idx_start, self.down_idx_end):
                 for j in range(len(self.pipe.unet.down_blocks[i].attentions)):
                     for k in range(
-                        len(self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks)
+                        len(
+                            self.pipe.unet.down_blocks[i]
+                            .attentions[j]
+                            .transformer_blocks
+                        )
                     ):
                         # FF Layers
                         if not moe_layers == "attn":
-                            self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                                k
-                            ].ff.gate.weight = nn.Parameter(gate_params[f"d{i}a{j}t{k}"])
+                            self.pipe.unet.down_blocks[i].attentions[
+                                j
+                            ].transformer_blocks[k].ff.gate.weight = nn.Parameter(
+                                gate_params[f"d{i}a{j}t{k}"]
+                            )
 
                         # Attns
                         if not moe_layers == "ff":
-                            self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
+                            self.pipe.unet.down_blocks[i].attentions[
+                                j
+                            ].transformer_blocks[
                                 k
                             ].attn1.to_q.gate.weight = nn.Parameter(
                                 gate_params[f"sattnqd{i}a{j}t{k}"]
                             )
 
-                            self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
+                            self.pipe.unet.down_blocks[i].attentions[
+                                j
+                            ].transformer_blocks[
                                 k
                             ].attn1.to_k.gate.weight = nn.Parameter(
                                 gate_params[f"sattnkd{i}a{j}t{k}"]
                             )
 
-                            self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
+                            self.pipe.unet.down_blocks[i].attentions[
+                                j
+                            ].transformer_blocks[
                                 k
                             ].attn1.to_v.gate.weight = nn.Parameter(
                                 gate_params[f"sattnvd{i}a{j}t{k}"]
                             )
 
-                            self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
+                            self.pipe.unet.down_blocks[i].attentions[
+                                j
+                            ].transformer_blocks[
                                 k
                             ].attn2.to_q.gate.weight = nn.Parameter(
                                 gate_params[f"cattnqd{i}a{j}t{k}"]
                             )
 
-                            self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
+                            self.pipe.unet.down_blocks[i].attentions[
+                                j
+                            ].transformer_blocks[
                                 k
                             ].attn2.to_k.gate.weight = nn.Parameter(
                                 gate_params[f"cattnkd{i}a{j}t{k}"]
                             )
 
-                            self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
+                            self.pipe.unet.down_blocks[i].attentions[
+                                j
+                            ].transformer_blocks[
                                 k
                             ].attn2.to_v.gate.weight = nn.Parameter(
                                 gate_params[f"cattnvd{i}a{j}t{k}"]
@@ -708,45 +780,61 @@ class SegMoEPipeline:
             for i in range(self.up_idx_start, self.up_idx_end):
                 for j in range(len(self.pipe.unet.up_blocks[i].attentions)):
                     for k in range(
-                        len(self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks)
+                        len(
+                            self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks
+                        )
                     ):
                         # FF Layers
                         if not moe_layers == "attn":
-                            self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                                k
-                            ].ff.gate.weight = nn.Parameter(gate_params[f"u{i}a{j}t{k}"])
+                            self.pipe.unet.up_blocks[i].attentions[
+                                j
+                            ].transformer_blocks[k].ff.gate.weight = nn.Parameter(
+                                gate_params[f"u{i}a{j}t{k}"]
+                            )
                         if not moe_layers == "ff":
-                            self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
+                            self.pipe.unet.up_blocks[i].attentions[
+                                j
+                            ].transformer_blocks[
                                 k
                             ].attn1.to_q.gate.weight = nn.Parameter(
                                 gate_params[f"sattnqu{i}a{j}t{k}"]
                             )
 
-                            self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
+                            self.pipe.unet.up_blocks[i].attentions[
+                                j
+                            ].transformer_blocks[
                                 k
                             ].attn1.to_k.gate.weight = nn.Parameter(
                                 gate_params[f"sattnku{i}a{j}t{k}"]
                             )
 
-                            self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
+                            self.pipe.unet.up_blocks[i].attentions[
+                                j
+                            ].transformer_blocks[
                                 k
                             ].attn1.to_v.gate.weight = nn.Parameter(
                                 gate_params[f"sattnvu{i}a{j}t{k}"]
                             )
 
-                            self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
+                            self.pipe.unet.up_blocks[i].attentions[
+                                j
+                            ].transformer_blocks[
                                 k
                             ].attn2.to_q.gate.weight = nn.Parameter(
                                 gate_params[f"cattnqu{i}a{j}t{k}"]
                             )
 
-                            self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
+                            self.pipe.unet.up_blocks[i].attentions[
+                                j
+                            ].transformer_blocks[
                                 k
                             ].attn2.to_k.gate.weight = nn.Parameter(
                                 gate_params[f"cattnku{i}a{j}t{k}"]
                             )
 
-                            self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
+                            self.pipe.unet.up_blocks[i].attentions[
+                                j
+                            ].transformer_blocks[
                                 k
                             ].attn2.to_v.gate.weight = nn.Parameter(
                                 gate_params[f"cattnvu{i}a{j}t{k}"]
@@ -767,10 +855,15 @@ class SegMoEPipeline:
         )
         gc.collect()
         torch.cuda.empty_cache()
-    
+
     def __call__(self, *args: Any, **kwds: Any) -> Any:
+        """
+        Inference the SegMoEPipeline.
+
+        Calls diffusers.DiffusionPipeline forward with the keyword arguments. See https://github.com/segmind/segmoe#usage for detailed usage.
+        """
         return self.pipe(*args, **kwds)
-    
+
     def create_empty(self, path):
         with open(f"{path}/unet/config.json") as f:
             config = json.load(f)
@@ -783,7 +876,7 @@ class SegMoEPipeline:
             for j in range(len(unet.down_blocks[i].attentions)):
                 for k in range(
                     len(unet.down_blocks[i].attentions[j].transformer_blocks)
-                ):  
+                ):
                     if not moe_layers == "attn":
                         config = {
                             "hidden_size": next(
@@ -796,9 +889,9 @@ class SegMoEPipeline:
                             "num_local_experts": num_experts,
                         }
                         # FF Layers
-                        layers = [unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].ff] * num_experts
+                        layers = [
+                            unet.down_blocks[i].attentions[j].transformer_blocks[k].ff
+                        ] * num_experts
                         unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
                         ].ff = SparseMoeBlock(config, layers)
@@ -812,23 +905,32 @@ class SegMoEPipeline:
                             "num_experts_per_tok": num_experts_per_tok,
                             "num_local_experts": num_experts,
                         }
-                        layers = [unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_q] * num_experts
+                        layers = [
+                            unet.down_blocks[i]
+                            .attentions[j]
+                            .transformer_blocks[k]
+                            .attn1.to_q
+                        ] * num_experts
                         unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
                         ].attn1.to_q = SparseMoeBlock(config, layers)
 
-                        layers = [unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_k] * num_experts
+                        layers = [
+                            unet.down_blocks[i]
+                            .attentions[j]
+                            .transformer_blocks[k]
+                            .attn1.to_k
+                        ] * num_experts
                         unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
                         ].attn1.to_k = SparseMoeBlock(config, layers)
 
-                        layers = [unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_v] * num_experts
+                        layers = [
+                            unet.down_blocks[i]
+                            .attentions[j]
+                            .transformer_blocks[k]
+                            .attn1.to_v
+                        ] * num_experts
                         unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
                         ].attn1.to_v = SparseMoeBlock(config, layers)
@@ -842,8 +944,12 @@ class SegMoEPipeline:
                             "num_local_experts": num_experts,
                         }
 
-                        layers = [unet.down_blocks[i].attentions[j].transformer_blocks
-                            [k].attn2.to_q] * num_experts
+                        layers = [
+                            unet.down_blocks[i]
+                            .attentions[j]
+                            .transformer_blocks[k]
+                            .attn2.to_q
+                        ] * num_experts
                         unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
                         ].attn2.to_q = SparseMoeBlock(config, layers)
@@ -860,9 +966,12 @@ class SegMoEPipeline:
                             .transformer_blocks[k]
                             .attn2.to_k.weight.size()[0],
                         }
-                        layers = [unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_k] * num_experts
+                        layers = [
+                            unet.down_blocks[i]
+                            .attentions[j]
+                            .transformer_blocks[k]
+                            .attn2.to_k
+                        ] * num_experts
                         unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
                         ].attn2.to_k = SparseMoeBlock(config, layers)
@@ -879,17 +988,18 @@ class SegMoEPipeline:
                             "num_experts_per_tok": num_experts_per_tok,
                             "num_local_experts": num_experts,
                         }
-                        layers = [unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_v] * num_experts
+                        layers = [
+                            unet.down_blocks[i]
+                            .attentions[j]
+                            .transformer_blocks[k]
+                            .attn2.to_v
+                        ] * num_experts
                         unet.down_blocks[i].attentions[j].transformer_blocks[
                             k
                         ].attn2.to_v = SparseMoeBlock(config, layers)
         for i in range(self.up_idx_start, self.up_idx_end):
             for j in range(len(unet.up_blocks[i].attentions)):
-                for k in range(
-                    len(unet.up_blocks[i].attentions[j].transformer_blocks)
-                ):
+                for k in range(len(unet.up_blocks[i].attentions[j].transformer_blocks)):
                     if not moe_layers == "attn":
                         config = {
                             "hidden_size": next(
@@ -902,9 +1012,9 @@ class SegMoEPipeline:
                             "num_local_experts": num_experts,
                         }
                         # FF Layers
-                        layers = [unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].ff] * num_experts
+                        layers = [
+                            unet.up_blocks[i].attentions[j].transformer_blocks[k].ff
+                        ] * num_experts
                         unet.up_blocks[i].attentions[j].transformer_blocks[
                             k
                         ].ff = SparseMoeBlock(config, layers)
@@ -920,9 +1030,12 @@ class SegMoEPipeline:
                             "num_local_experts": num_experts,
                         }
 
-                        layers = [unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_q] * num_experts
+                        layers = [
+                            unet.up_blocks[i]
+                            .attentions[j]
+                            .transformer_blocks[k]
+                            .attn1.to_q
+                        ] * num_experts
 
                         unet.up_blocks[i].attentions[j].transformer_blocks[
                             k
@@ -936,9 +1049,12 @@ class SegMoEPipeline:
                             "num_experts_per_tok": num_experts_per_tok,
                             "num_local_experts": num_experts,
                         }
-                        layers = [unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_k] * num_experts
+                        layers = [
+                            unet.up_blocks[i]
+                            .attentions[j]
+                            .transformer_blocks[k]
+                            .attn1.to_k
+                        ] * num_experts
 
                         unet.up_blocks[i].attentions[j].transformer_blocks[
                             k
@@ -952,9 +1068,12 @@ class SegMoEPipeline:
                             "num_experts_per_tok": num_experts_per_tok,
                             "num_local_experts": num_experts,
                         }
-                        layers = [unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_v] * num_experts
+                        layers = [
+                            unet.up_blocks[i]
+                            .attentions[j]
+                            .transformer_blocks[k]
+                            .attn1.to_v
+                        ] * num_experts
 
                         unet.up_blocks[i].attentions[j].transformer_blocks[
                             k
@@ -968,9 +1087,12 @@ class SegMoEPipeline:
                             "num_experts_per_tok": num_experts_per_tok,
                             "num_local_experts": num_experts,
                         }
-                        layers = [unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_q] * num_experts
+                        layers = [
+                            unet.up_blocks[i]
+                            .attentions[j]
+                            .transformer_blocks[k]
+                            .attn2.to_q
+                        ] * num_experts
 
                         unet.up_blocks[i].attentions[j].transformer_blocks[
                             k
@@ -989,9 +1111,12 @@ class SegMoEPipeline:
                             "num_local_experts": num_experts,
                         }
 
-                        layers = [unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_k] * num_experts
+                        layers = [
+                            unet.up_blocks[i]
+                            .attentions[j]
+                            .transformer_blocks[k]
+                            .attn2.to_k
+                        ] * num_experts
 
                         unet.up_blocks[i].attentions[j].transformer_blocks[
                             k
@@ -1009,9 +1134,12 @@ class SegMoEPipeline:
                             "num_experts_per_tok": num_experts_per_tok,
                             "num_local_experts": num_experts,
                         }
-                        layers = [unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_v] * num_experts
+                        layers = [
+                            unet.up_blocks[i]
+                            .attentions[j]
+                            .transformer_blocks[k]
+                            .attn2.to_v
+                        ] * num_experts
 
                         unet.up_blocks[i].attentions[j].transformer_blocks[
                             k
@@ -1019,11 +1147,23 @@ class SegMoEPipeline:
         return unet
 
     def save_pretrained(self, path):
+        """
+        Save SegMoEPipeline to Disk.
+
+        Usage:
+        pipeline.save_pretrained(path)
+
+        Parameters:
+        path: Path to Directory to save the model in.
+        """
         for param in self.pipe.unet.parameters():
             param.data = param.data.contiguous()
         self.pipe.unet.config["segmoe_config"] = self.config
         self.pipe.save_pretrained(path)
-        safetensors.torch.save_file(self.pipe.unet.state_dict(),f'{path}/unet/diffusion_pytorch_model.safetensors')
+        safetensors.torch.save_file(
+            self.pipe.unet.state_dict(),
+            f"{path}/unet/diffusion_pytorch_model.safetensors",
+        )
 
     def cast_hook(self, pipe, dicts):
         for i in range(self.down_idx_start, self.down_idx_end):
@@ -1166,4 +1306,3 @@ class SegMoEPipeline:
             gate_vects[h].permute(1, 0)
 
         return gate_vects
-    
