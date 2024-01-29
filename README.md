@@ -15,7 +15,7 @@ from segmoe import SegMoEPipeline
 
 pipeline = SegMoEPipeline("segmind/SegMoE-v0", device = "cuda")
 
-prompt = "cosmic canvas,  orange city background, painting of a chubby cat"
+prompt = "cosmic canvas, orange city background, painting of a chubby cat"
 negative_prompt = "nsfw, bad quality, worse quality"
 img = pipeline(
     prompt=prompt,
@@ -135,7 +135,7 @@ from segmoe import SegMoEPipeline
 pipeline = SegMoETurboPipeline("turbo_config.yaml", device = "cuda")
 pipeline.pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.pipe.scheduler.config)
 
-prompt = "cinematic photo (art by Mathias Goeritz:0.9) , photograph, Lush Girlfriend, looking at the camera smiling, Rich ginger hair, Winter, tilt shift, Horror, specular lighting, film grain, Samsung Galaxy, F/5, (cinematic still:1.2), freckles . 35mm photograph, film, bokeh, professional, 4k, highly detailed"
+prompt = "cosmic canvas, orange city background, painting of a chubby cat"
 
 image = pipe(prompt=prompt, num_inference_steps=6, guidance_scale=2).images[0]  
 
