@@ -1,6 +1,6 @@
 # SegMoE: Segmind Mixture of Experts
 
-A Framework to combine multiple Stable Diffusion XL models into a mixture of experts model. Functions similar to [mergekit](https://github.com/cg123/mergekit)'s mixtral branch but for Stable Diffusion XL models.
+A Framework to combine multiple Stable Diffusion models into a mixture of experts model. Functions similar to [mergekit](https://github.com/cg123/mergekit)'s mixtral branch but for Stable Diffusion models.
 
 ## Installation
 
@@ -141,6 +141,11 @@ image = pipe(prompt=prompt, num_inference_steps=6, guidance_scale=2).images[0]
 
 image.save("image.png")
 ```
+### Stable Diffusion 1.5 Support
+
+Stable Diffusion 1.5 Models are also supported and work natively.
+
+**Note:** Stable Diffusion 1.5 Models can be combined with other SD1.5 Models only.
 
 ## Advantages
 + Benefits from The Knowledge of Several Finetuned Experts
@@ -152,7 +157,7 @@ image.save("image.png")
 + The framework is not yet optimized for memory usage.
 
 ## Research Roadmap
-- [*] Optimize for Speed
+- [ ] Optimize for Speed
 - [ ] Optimize for Memory Usage
 - [ ] Add Support for LoRAs
 - [ ] Add Support for More Models
