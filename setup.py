@@ -6,7 +6,7 @@ this_directory = Path(__file__).parent
 long_description = (this_directory / "README.md").read_text()
 
 setup(name='segmoe',
-      version='0.0.1',
+      version='0.0.2',
       description='Package for Mixing Stable Diffusiion XL Models by Segmind',
       url='https://github.com/segmind/segmoe',
       author='Yatharth Gupta',

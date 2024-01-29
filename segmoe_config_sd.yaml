@@ -1,0 +1,17 @@
+base_model: SG161222/Realistic_Vision_V6.0_B1_noVAE
+num_experts: 4
+moe_layers: all
+num_experts_per_tok: 2
+experts:
+  - source_model: SG161222/Realistic_Vision_V6.0_B1_noVAE
+    positive_prompt: "cinematic, portrait, photograph, instagram, fashion, movie, macro shot, 8K, RAW, hyperrealistic, ultra realistic,"
+    negative_prompt: " (deformed iris, deformed pupils, semi-realistic, cgi, 3d, render, sketch, cartoon, drawing, anime), text, cropped, out of frame, worst quality, low quality, jpeg artifacts, ugly, duplicate, morbid, mutilated, extra fingers, mutated hands, poorly drawn hands, poorly drawn face, mutation, deformed, blurry, dehydrated, bad anatomy, bad proportions, extra limbs, cloned face, disfigured, gross proportions, malformed limbs, missing arms, missing legs, extra arms, extra legs, fused fingers, too many fingers, long neck"
+  - source_model: dreamlike-art/dreamlike-anime-1.0
+    positive_prompt: "photo anime, masterpiece, high quality, absurdres, 1girl, 1boy, waifu, chibi"
+    negative_prompt: "simple background, duplicate, retro style, low quality, lowest quality, 1980s, 1990s, 2000s, 2005 2006 2007 2008 2009 2010 2011 2012 2013, bad anatomy, bad proportions, extra digits, lowres, username, artist name, error, duplicate, watermark, signature, text, extra digit, fewer digits, worst quality, jpeg artifacts, blurry"
+  - source_model: Lykon/dreamshaper-8
+    positive_prompt: "bokeh, intricate, elegant, sharp focus, soft lighting, vibrant colors, dreamlike, fantasy, artstation, concept art"
+    negative_prompt: "low quality, lowres, jpeg artifacts, signature, bad anatomy, extra legs, extra arms, extra fingers, poorly drawn hands, poorly drawn feet, disfigured, out of frame, tiling, bad art, deformed, mutated, blurry, fuzzy, misshaped, mutant, gross, disgusting, ugly, watermark, watermarks"
+  - source_model: dreamlike-art/dreamlike-diffusion-1.0
+    positive_prompt: "dreamlikeart, a grungy woman with rainbow hair, travelling between dimensions, dynamic pose, happy, soft eyes and narrow chin, extreme bokeh, dainty figure, long hair straight down, torn kawaii shirt and baggy jeans, In style of by Jordan Grimmer and greg rutkowski, crisp lines and color, complex background, particles, lines, wind, concept art, sharp focus, vivid colors"
+    negative_prompt: "nude, naked, low quality, lowres, jpeg artifacts, signature, bad anatomy, extra legs, extra arms, extra fingers, poorly drawn hands, poorly drawn feet, disfigured, out of frame"
