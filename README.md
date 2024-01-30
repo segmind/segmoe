@@ -2,7 +2,7 @@
 
 ![image](./image.png)
 
-A Framework to combine multiple Stable Diffusion models into a Mixture of Experts model. Inspired by [mergekit](https://github.com/cg123/mergekit)'s mixtral branch but for Stable Diffusion models.
+SegMoE is a powerful framework for dynamically combining Stable Diffusion Models into a Mixture of Experts within minutes without training. The framework allows for creation of larger models on the fly which offer larger knowledge, better adherence and better image quality. It is inspired by [mergekit](https://github.com/cg123/mergekit)'s mixtral branch but for Stable Diffusion models.
 
 ## Installation
 
