@@ -195,9 +195,9 @@ class SegMoEPipeline:
             self.down_idx_start = 1
             self.down_idx_end = len(self.pipe.unet.down_blocks)
         self.config["up_idx_start"] = self.up_idx_start
-        self.config["up_idx_en"] = self.up_idx_end
+        self.config["up_idx_end"] = self.up_idx_end
         self.config["down_idx_start"] = self.down_idx_start
-        self.config["down_idx_start"] = self.down_idx_end
+        self.config["down_idx_end"] = self.down_idx_end
 
         # TODO: Add Support for Scheduler Selection
         self.pipe.scheduler = DDPMScheduler.from_config(self.pipe.scheduler.config)
@@ -872,6 +872,10 @@ class SegMoEPipeline:
         num_experts_per_tok = self.config["num_experts_per_tok"]
         num_experts = self.config["num_experts"]
         moe_layers = self.config["moe_layers"]
+        self.up_idx_start = self.config["up_idx_start"] 
+        self.up_idx_end = self.config["up_idx_end"]
+        self.down_idx_start = self.config["down_idx_start"]
+        self.down_idx_end = self.config["down_idx_end"]
         for i in range(self.down_idx_start, self.down_idx_end):
             for j in range(len(unet.down_blocks[i].attentions)):
                 for k in range(
