@@ -155,7 +155,7 @@ Usage:
 
 from segmoe import SegMoEPipeline
 
-pipeline = SegMoETurboPipeline("segomoe_config_turbo.yaml", device = "cuda")
+pipeline = SegMoEPipeline("segomoe_config_turbo.yaml", device = "cuda")
 pipeline.pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.pipe.scheduler.config)
 
 prompt = "cosmic canvas, orange city background, painting of a chubby cat"
