@@ -176,7 +176,7 @@ class SegMoEPipeline:
             if not os.path.isfile("base/model.safetensors"):
                 os.system(
                     "wget -O "
-                    + "base/model.safetensors"
+                    + "base/model.safetensors "
                     + self.config["base_model"]
                     + " --content-disposition"
                 )
@@ -239,7 +239,7 @@ class SegMoEPipeline:
                             if not os.path.isfile(f"expert_{i}/model.safetensors"):
                                 os.system(
                                     f"wget {exp['source_model']} -O "
-                                    + f"expert_{i}/model.safetensors"
+                                    + f"expert_{i}/model.safetensors "
                                     + " --content-disposition"
                                 )
                         exp["source_model"] = f"expert_{i}/model.safetensors"
