@@ -164,8 +164,10 @@ class SegMoEPipeline:
         self.config["moe_layers"] = moe_layers
         if self.config.get("type", "sdxl") == "sdxl":
             self.base_cls = StableDiffusionXLPipeline
+            self.config["type"] = "sdxl"
         elif self.config.get("type", "sdxl") == "sd":
-                self.base_cls = StableDiffusionPipeline
+            self.base_cls = StableDiffusionPipeline
+            self.config["type"] = "sd"
         else:
             raise NotImplementedError("Base class not yet supported, type should be one of ['sd','sdxl]")
         # Load Base Model
