@@ -173,7 +173,7 @@ Stable Diffusion 1.5 Models are also supported and work natively. Example config
 
 ## Memory Requirements
 
-- SDXL 2xN : 20GB
+- SDXL 2xN : 19GB
 - SDXL 4xN : 25GB
 - SD1.5 4xN : 7GB
 
