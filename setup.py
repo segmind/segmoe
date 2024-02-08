@@ -20,7 +20,8 @@ setup(name='segmoe',
           'torch>=2.0.0',
           'safetensors',
           'diffusers',
-          'transformers'
+          'transformers',
+          'accelerate'
       ],
       long_description=long_description,
       long_description_content_type='text/markdown',

@@ -1,6 +1,6 @@
 # SegMoE: Segmind Mixture of Diffusion Experts
 
-![image](./image.png)
+![image/png](https://cdn-uploads.huggingface.co/production/uploads/62f8ca074588fe31f4361dae/TJTQyN9tav94fVcvpZGq8.png)
 
 SegMoE is a powerful framework for dynamically combining Stable Diffusion Models into a Mixture of Experts within minutes without training. The framework allows for creation of larger models on the fly which offer larger knowledge, better adherence and better image quality. It is inspired by [mergekit](https://github.com/cg123/mergekit)'s mixtral branch but for Stable Diffusion models.
 
@@ -68,6 +68,7 @@ base_model: Base Model Path, Model Card or CivitAI Download Link
 num_experts: Number of experts to use
 moe_layers: Type of Layers to Mix (can be "ff", "attn" or "all"). Defaults to "attn"
 num_experts_per_tok: Number of Experts to use 
+type: Type of the individual models (can be "sd" or "sdxl"). Defaults to "sdxl"
 experts:
   - source_model: Expert 1 Path, Model Card or CivitAI Download Link
     positive_prompt: Positive Prompt for computing gate weights
@@ -155,7 +156,7 @@ Usage:
 
 from segmoe import SegMoEPipeline
 
-pipeline = SegMoETurboPipeline("segomoe_config_turbo.yaml", device = "cuda")
+pipeline = SegMoEPipeline("segomoe_config_turbo.yaml", device = "cuda")
 pipeline.pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipeline.pipe.scheduler.config)
 
 prompt = "cosmic canvas, orange city background, painting of a chubby cat"
@@ -169,6 +170,12 @@ image.save("image.png")
 Stable Diffusion 1.5 Models are also supported and work natively. Example config can be found [here](./segmoe_config_sd.yaml)
 
 **Note:** Stable Diffusion 1.5 Models can be combined with other SD1.5 Models only.
+
+## Memory Requirements
+
+- SDXL 2xN : 19GB
+- SDXL 4xN : 25GB
+- SD1.5 4xN : 7GB
 
 ## Advantages
 + Benefits from The Knowledge of Several Finetuned Experts
@@ -192,7 +199,7 @@ Stable Diffusion 1.5 Models are also supported and work natively. Example config
 
 ### Base Model
 
-The base model is the model that will be used to generate the initial image. It can be a Huggingface model card, a CivitAI model download link. 
+The base model is the model that will be used to generate the initial image. It can be a Huggingface model card, a CivitAI model download link or a local path to a safetensors file. 
 
 ### Number of Experts
 
@@ -202,9 +209,13 @@ The number of experts to use in the mixture of experts model. The number of expe
 
 The type of layers to mix. Can be "ff", "attn" or "all". Defaults to "attn". "ff" merges only the feedforward layers, "attn" merges only the attention layers and "all" merges all layers.
 
+### Type
+
+The type of the models to mix. Can be "sd" or "sdxl". Defaults to "sdxl".
+
 ### Experts
 
-The Experts are the models that will be used to generate the final image. Each expert must have a source model, a positive prompt and a negative prompt. The source model can be a Huggingface model card, a CivitAI model download link. The positive prompt and negative prompt are the prompts that will be used to compute the gate weights for each expert and impact the quality of the final model, choose these carefully.
+The Experts are the models that will be used to generate the final image. Each expert must have a source model, a positive prompt and a negative prompt. The source model can be a Huggingface model card, a CivitAI model download link or a local path to a safetensors file. The positive prompt and negative prompt are the prompts that will be used to compute the gate weights for each expert and impact the quality of the final model, choose these carefully.
 
 ## Citation
 
