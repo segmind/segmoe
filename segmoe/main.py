@@ -114,7 +114,7 @@ class SegMoEPipeline:
             self.load_from_scratch(config_or_path, **kwargs)
         else:
             if not os.path.isdir(config_or_path):
-                cached_folder = DiffusionPipeline.download(config_or_path)
+                cached_folder = DiffusionPipeline.download(config_or_path, **kwargs)
             else:
                 cached_folder = config_or_path
             unet = self.create_empty(cached_folder)
