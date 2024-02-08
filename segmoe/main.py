@@ -41,7 +41,7 @@ class SparseMoeBlock(nn.Module):
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
         self.experts = nn.ModuleList([deepcopy(exp) for exp in experts])
 
-    def forward(self, hidden_states: torch.Tensor, scale) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         batch_size, sequence_length, f_map_sz = hidden_states.shape
         hidden_states = hidden_states.view(-1, f_map_sz)
         # router_logits: (batch * sequence_length, n_experts)
@@ -114,7 +114,7 @@ class SegMoEPipeline:
             self.load_from_scratch(config_or_path, **kwargs)
         else:
             if not os.path.isdir(config_or_path):
-                cached_folder = DiffusionPipeline.download(config_or_path)
+                cached_folder = DiffusionPipeline.download(config_or_path, **kwargs)
             else:
                 cached_folder = config_or_path
             unet = self.create_empty(cached_folder)
@@ -123,11 +123,18 @@ class SegMoEPipeline:
                     f"{cached_folder}/unet/diffusion_pytorch_model.safetensors"
                 )
             )
-            self.pipe = DiffusionPipeline.from_pretrained(
+            if self.config.get("type", "sdxl") == "sdxl":
+                self.base_cls = StableDiffusionXLPipeline
+            elif self.config.get("type", "sdxl") == "sd":
+                self.base_cls = StableDiffusionPipeline
+            else:
+                raise NotImplementedError("Base class not yet supported, type should be one of ['sd','sdxl]")
+            self.pipe = self.base_cls.from_pretrained(
                 cached_folder,
                 unet=unet,
                 torch_dtype=self.torch_dtype,
                 use_safetensors=self.use_safetensors,
+                **kwargs
             )
             self.pipe.to(self.device)
             self.pipe.unet.to(
@@ -155,6 +162,14 @@ class SegMoEPipeline:
         self.config["num_experts_per_tok"] = num_experts_per_tok
         moe_layers = self.config.get("moe_layers", "attn")
         self.config["moe_layers"] = moe_layers
+        if self.config.get("type", "sdxl") == "sdxl":
+            self.base_cls = StableDiffusionXLPipeline
+            self.config["type"] = "sdxl"
+        elif self.config.get("type", "sdxl") == "sd":
+            self.base_cls = StableDiffusionPipeline
+            self.config["type"] = "sd"
+        else:
+            raise NotImplementedError("Base class not yet supported, type should be one of ['sd','sdxl]")
         # Load Base Model
         if self.config["base_model"].startswith(
             "https://civitai.com/api/download/models/"
@@ -163,17 +178,24 @@ class SegMoEPipeline:
             if not os.path.isfile("base/model.safetensors"):
                 os.system(
                     "wget -O "
-                    + "base/model.safetensors"
+                    + "base/model.safetensors "
                     + self.config["base_model"]
                     + " --content-disposition"
                 )
             self.config["base_model"] = "base/model.safetensors"
-            self.pipe = DiffusionPipeline.from_single_file(
+            self.pipe = self.base_cls.from_single_file(
                 self.config["base_model"], torch_dtype=self.torch_dtype
+            )
+        elif os.path.isfile(self.config["base_model"]):
+            self.pipe = self.base_cls.from_single_file(
+                self.config["base_model"],
+                torch_dtype=self.torch_dtype,
+                use_safetensors=self.use_safetensors,
+                **kwargs,
             )
         else:
             try:
-                self.pipe = DiffusionPipeline.from_pretrained(
+                self.pipe = self.base_cls.from_pretrained(
                     self.config["base_model"],
                     torch_dtype=self.torch_dtype,
                     use_safetensors=self.use_safetensors,
@@ -181,15 +203,15 @@ class SegMoEPipeline:
                     **kwargs,
                 )
             except:
-                self.pipe = DiffusionPipeline.from_pretrained(
+                self.pipe = self.base_cls.from_pretrained(
                     self.config["base_model"], torch_dtype=self.torch_dtype, **kwargs
                 )
-        if self.pipe.__class__ == StableDiffusionPipeline:
+        if self.base_cls == StableDiffusionPipeline:
             self.up_idx_start = 1
             self.up_idx_end = len(self.pipe.unet.up_blocks)
             self.down_idx_start = 0
             self.down_idx_end = len(self.pipe.unet.down_blocks) - 1
-        elif self.pipe.__class__ == StableDiffusionXLPipeline:
+        elif self.base_cls == StableDiffusionXLPipeline:
             self.up_idx_start = 0
             self.up_idx_end = len(self.pipe.unet.up_blocks) - 1
             self.down_idx_start = 1
@@ -219,19 +241,30 @@ class SegMoEPipeline:
                             if not os.path.isfile(f"expert_{i}/model.safetensors"):
                                 os.system(
                                     f"wget {exp['source_model']} -O "
-                                    + f"expert_{i}/model.safetensors"
+                                    + f"expert_{i}/model.safetensors "
                                     + " --content-disposition"
                                 )
                         exp["source_model"] = f"expert_{i}/model.safetensors"
-                        expert = DiffusionPipeline.from_single_file(
-                            exp["source_model"],
+                        expert = self.base_cls.from_single_file(
+                            exp["source_model"], **kwargs
                         ).to(self.device, self.torch_dtype)
                     except Exception as e:
                         print(f"Expert {i} {exp['source_model']} failed to load")
                         print("Error:", e)
+                elif os.path.isfile(exp["source_model"]):
+                    expert = self.base_cls.from_single_file(
+                        exp["source_model"],
+                        torch_dtype=self.torch_dtype,
+                        use_safetensors=self.use_safetensors,
+                        variant=self.variant,
+                        **kwargs,
+                    )
+                    expert.scheduler = DDPMScheduler.from_config(
+                        expert.scheduler.config
+                    )
                 else:
                     try:
-                        expert = DiffusionPipeline.from_pretrained(
+                        expert = self.base_cls.from_pretrained(
                             exp["source_model"],
                             torch_dtype=self.torch_dtype,
                             use_safetensors=self.use_safetensors,
@@ -244,7 +277,7 @@ class SegMoEPipeline:
                             expert.scheduler.config
                         )
                     except:
-                        expert = DiffusionPipeline.from_pretrained(
+                        expert = self.base_cls.from_pretrained(
                             exp["source_model"], torch_dtype=self.torch_dtype, **kwargs
                         )
                         expert.scheduler = DDPMScheduler.from_config(

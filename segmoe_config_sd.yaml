@@ -2,6 +2,7 @@ base_model: SG161222/Realistic_Vision_V6.0_B1_noVAE
 num_experts: 4
 moe_layers: all
 num_experts_per_tok: 2
+type: sd
 experts:
   - source_model: SG161222/Realistic_Vision_V6.0_B1_noVAE
     positive_prompt: "cinematic, portrait, photograph, instagram, fashion, movie, macro shot, 8K, RAW, hyperrealistic, ultra realistic,"
