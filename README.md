@@ -171,6 +171,50 @@ Stable Diffusion 1.5 Models are also supported and work natively. Example config
 
 **Note:** Stable Diffusion 1.5 Models can be combined with other SD1.5 Models only.
 
+## Other Tasks
+
+Our Framework is tightly integrated with the [Diffusers](https://github.com/huggingface/diffusers) package which allows the use of `AutoPipelineForImage2Image`, `AutoPipelineForInpainting` and any other pipeline which supports the `from_pipe` method.
+
+### Image to Image
+
+Here is example code for Image to Image generation:
+
+```python
+from segmoe import SegMoEPipeline
+from diffusers import AutoPipelineForImage2Image
+t2i = SegMoEPipeline("segmind/SegMoE-SD-4x2-v0")
+
+prompt = "cosmic canvas,  orange city background, painting of a chubby cat"
+negative_prompt = "nsfw, bad quality, worse quality"
+img = t2i(
+    prompt=prompt,
+    negative_prompt=negative_prompt,
+    height=1024,
+    width=1024,
+    num_inference_steps=25,
+    guidance_scale=7.5,
+).images[0]
+img.save("base_image.png")
+pipeline = AutoPipelineForImage2Image.from_pipe(t2i.pipe)
+prompt = "cosmic canvas,  orange city background, painting of a dog"
+image = pipeline(prompt, img).images[0]
+image.save("changed_image.png")
+```
+
+### Inpainting
+
+Here is example code for Inpainting:
+
+```python
+from segmoe import SegMoEPipeline
+from diffusers import AutoPipelineForInpainting
+
+t2i = SegMoEPipeline("segmind/SegMoE-SD-4x2-v0")
+pipeline = AutoPipelineForInpainting.from_pipe(t2i.pipe)
+image = pipeline(prompt, image=init_image, mask_image=mask_image).images[0]
+image.save("inpainted_image.png")
+```
+
 ## Memory Requirements
 
 - SDXL 2xN : 19GB
