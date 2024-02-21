@@ -909,278 +909,61 @@ class SegMoEPipeline:
         self.up_idx_end = self.config["up_idx_end"]
         self.down_idx_start = self.config["down_idx_start"]
         self.down_idx_end = self.config["down_idx_end"]
-        for i in range(self.down_idx_start, self.down_idx_end):
-            for j in range(len(unet.down_blocks[i].attentions)):
-                for k in range(
-                    len(unet.down_blocks[i].attentions[j].transformer_blocks)
-                ):
-                    if not moe_layers == "attn":
-                        config = {
-                            "hidden_size": next(
-                                unet.down_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .ff.parameters()
-                            ).size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-                        # FF Layers
-                        layers = [
-                            unet.down_blocks[i].attentions[j].transformer_blocks[k].ff
-                        ] * num_experts
-                        unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].ff = SparseMoeBlock(config, layers)
-                    if not moe_layers == "ff":
-                        ## Attns
-                        config = {
-                            "hidden_size": unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_q.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-                        layers = [
-                            unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_q
-                        ] * num_experts
-                        unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_q = SparseMoeBlock(config, layers)
 
-                        layers = [
-                            unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_k
-                        ] * num_experts
-                        unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_k = SparseMoeBlock(config, layers)
+        down_blocks = list(map(lambda i: unet.down_blocks[i], range(self.down_idx_start, self.down_idx_end)))
+        up_blocks = list(map(lambda i: unet.up_blocks[i], range(self.up_idx_start, self.up_idx_end)))
 
-                        layers = [
-                            unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_v
-                        ] * num_experts
-                        unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_v = SparseMoeBlock(config, layers)
+        config_base = {
+            "num_experts_per_tok": num_experts_per_tok,
+            "num_local_experts": num_experts,
+        }
+
+        for block in down_blocks + up_blocks:
+            for attention in block.attentions:
+                for transformer in attention.transformer_blocks:
+                    if moe_layers != "attn":
+                        config = {
+                            "hidden_size": next(transformer.ff.parameters()).size()[-1],
+                            **config_base,
+                        }
+                        layers = [transformer.ff] * num_experts
+                        transformer.ff = SparseMoeBlock(config, layers)
+                    if moe_layers != "ff":
+                        config = {
+                            "hidden_size": transformer.attn1.to_q.weight.size()[-1],
+                            **config_base,
+                        }
+                        layers = [transformer.attn1.to_q] * num_experts
+                        transformer.attn1.to_q = SparseMoeBlock(config, layers)
+
+                        layers = [transformer.attn1.to_k] * num_experts
+                        transformer.attn1.to_k = SparseMoeBlock(config, layers)
+                        
+                        layers = [transformer.attn1.to_v] * num_experts
+                        transformer.attn1.to_v = SparseMoeBlock(config, layers)
 
                         config = {
-                            "hidden_size": unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_q.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
+                            "hidden_size": transformer.attn2.to_q.weight.size()[-1],
+                            **config_base,
                         }
-
-                        layers = [
-                            unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_q
-                        ] * num_experts
-                        unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_q = SparseMoeBlock(config, layers)
+                        layers = [transformer.attn2.to_q] * num_experts
+                        transformer.attn2.to_q = SparseMoeBlock(config, layers)
 
                         config = {
-                            "hidden_size": unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                            "out_dim": unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k.weight.size()[0],
+                            "hidden_size": transformer.attn2.to_k.weight.size()[-1],
+                            "out_dim": transformer.attn2.to_k.weight.size()[0],
+                            **config_base,
                         }
-                        layers = [
-                            unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k
-                        ] * num_experts
-                        unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_k = SparseMoeBlock(config, layers)
+                        layers = [transformer.attn2.to_k] * num_experts
+                        transformer.attn2.to_k = SparseMoeBlock(config, layers)
 
                         config = {
-                            "hidden_size": unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v.weight.size()[-1],
-                            "out_dim": unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v.weight.size()[0],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
+                            "hidden_size": transformer.attn2.to_v.weight.size()[-1],
+                            "out_dim": transformer.attn2.to_v.weight.size()[0],
+                            **config_base,
                         }
-                        layers = [
-                            unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v
-                        ] * num_experts
-                        unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_v = SparseMoeBlock(config, layers)
-        for i in range(self.up_idx_start, self.up_idx_end):
-            for j in range(len(unet.up_blocks[i].attentions)):
-                for k in range(len(unet.up_blocks[i].attentions[j].transformer_blocks)):
-                    if not moe_layers == "attn":
-                        config = {
-                            "hidden_size": next(
-                                unet.up_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .ff.parameters()
-                            ).size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-                        # FF Layers
-                        layers = [
-                            unet.up_blocks[i].attentions[j].transformer_blocks[k].ff
-                        ] * num_experts
-                        unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].ff = SparseMoeBlock(config, layers)
-
-                    if not moe_layers == "ff":
-                        # Attns
-                        config = {
-                            "hidden_size": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_q.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-
-                        layers = [
-                            unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_q
-                        ] * num_experts
-
-                        unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_q = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_k.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-                        layers = [
-                            unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_k
-                        ] * num_experts
-
-                        unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_k = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_v.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-                        layers = [
-                            unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_v
-                        ] * num_experts
-
-                        unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_v = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_q.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-                        layers = [
-                            unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_q
-                        ] * num_experts
-
-                        unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_q = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k.weight.size()[-1],
-                            "out_dim": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k.weight.size()[0],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-
-                        layers = [
-                            unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k
-                        ] * num_experts
-
-                        unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_k = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v.weight.size()[-1],
-                            "out_dim": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v.weight.size()[0],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-                        layers = [
-                            unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v
-                        ] * num_experts
-
-                        unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_v = SparseMoeBlock(config, layers)
+                        layers = [transformer.attn2.to_v] * num_experts
+                        transformer.attn2.to_v = SparseMoeBlock(config, layers)
         return unet
 
     def save_pretrained(self, path):
