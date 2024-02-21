@@ -910,15 +910,16 @@ class SegMoEPipeline:
         self.down_idx_start = self.config["down_idx_start"]
         self.down_idx_end = self.config["down_idx_end"]
 
-        down_blocks = list(map(lambda i: unet.down_blocks[i], range(self.down_idx_start, self.down_idx_end)))
-        up_blocks = list(map(lambda i: unet.up_blocks[i], range(self.up_idx_start, self.up_idx_end)))
+        down_blocks = list(map(lambda i: ("d", unet.down_blocks[i]), range(self.down_idx_start, self.down_idx_end)))
+        up_blocks = list(map(lambda i: ("u", unet.up_blocks[i]), range(self.up_idx_start, self.up_idx_end)))
+        self.all_blocks = down_blocks + up_blocks
 
         config_base = {
             "num_experts_per_tok": num_experts_per_tok,
             "num_local_experts": num_experts,
         }
 
-        for block in down_blocks + up_blocks:
+        for _, block in all_blocks:
             for attention in block.attentions:
                 for transformer in attention.transformer_blocks:
                     if moe_layers != "attn":
@@ -986,91 +987,18 @@ class SegMoEPipeline:
         )
 
     def cast_hook(self, pipe, dicts):
-        for i in range(self.down_idx_start, self.down_idx_end):
-            for j in range(len(pipe.unet.down_blocks[i].attentions)):
-                for k in range(
-                    len(pipe.unet.down_blocks[i].attentions[j].transformer_blocks)
-                ):
-                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].ff.register_forward_hook(getActivation(dicts, f"d{i}a{j}t{k}"))
+        for i, (t, block) in enumerate(self.all_blocks):
+            for j, attention in enumerate(block.attentions):
+                for k, transformer in enumerate(attention.transformer_blocks):
+                    transformer.ff.register_forward_hook(getActivation(dicts, f"{t}{i}a{j}t{k}"))
 
-                    ## Down Self Attns
-                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn1.to_q.register_forward_hook(
-                        getActivation(dicts, f"sattnqd{i}a{j}t{k}")
-                    )
-                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn1.to_k.register_forward_hook(
-                        getActivation(dicts, f"sattnkd{i}a{j}t{k}")
-                    )
-                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn1.to_v.register_forward_hook(
-                        getActivation(dicts, f"sattnvd{i}a{j}t{k}")
-                    )
+                    transformer.attn1.to_q.register_forward_hook(getActivation(dicts, f"sattnq{t}{i}a{j}t{k}"))
+                    transformer.attn1.to_k.register_forward_hook(getActivation(dicts, f"sattnk{t}{i}a{j}t{k}"))
+                    transformer.attn1.to_v.register_forward_hook(getActivation(dicts, f"sattnv{t}{i}a{j}t{k}"))
 
-                    ## Down Cross Attns
-
-                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn2.to_q.register_forward_hook(
-                        getActivation(dicts, f"cattnqd{i}a{j}t{k}")
-                    )
-                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn2.to_k.register_forward_hook(
-                        getActivation(dicts, f"cattnkd{i}a{j}t{k}")
-                    )
-                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn2.to_v.register_forward_hook(
-                        getActivation(dicts, f"cattnvd{i}a{j}t{k}")
-                    )
-
-        for i in range(self.up_idx_start, self.up_idx_end):
-            for j in range(len(pipe.unet.up_blocks[i].attentions)):
-                for k in range(
-                    len(pipe.unet.up_blocks[i].attentions[j].transformer_blocks)
-                ):
-                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].ff.register_forward_hook(getActivation(dicts, f"u{i}a{j}t{k}"))
-                    ## Up Self Attns
-                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn1.to_q.register_forward_hook(
-                        getActivation(dicts, f"sattnqu{i}a{j}t{k}")
-                    )
-                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn1.to_k.register_forward_hook(
-                        getActivation(dicts, f"sattnku{i}a{j}t{k}")
-                    )
-                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn1.to_v.register_forward_hook(
-                        getActivation(dicts, f"sattnvu{i}a{j}t{k}")
-                    )
-
-                    ## Up Cross Attns
-                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn2.to_q.register_forward_hook(
-                        getActivation(dicts, f"cattnqu{i}a{j}t{k}")
-                    )
-                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn2.to_k.register_forward_hook(
-                        getActivation(dicts, f"cattnku{i}a{j}t{k}")
-                    )
-                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn2.to_v.register_forward_hook(
-                        getActivation(dicts, f"cattnvu{i}a{j}t{k}")
-                    )
+                    transformer.attn2.to_q.register_forward_hook(getActivation(dicts, f"cattnq{t}{i}a{j}t{k}"))
+                    transformer.attn2.to_k.register_forward_hook(getActivation(dicts, f"cattnk{t}{i}a{j}t{k}"))
+                    transformer.attn2.to_v.register_forward_hook(getActivation(dicts, f"cattnv{t}{i}a{j}t{k}"))
 
     @torch.no_grad
     def get_hidden_states(self, model, positive, negative, average: bool = True):
