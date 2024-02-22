@@ -42,7 +42,7 @@ def move(module, moe_device):
         else:
             module.to(device=device, dtype=dtype, memory_format=memory_format)
             for child in module.children():
-                move_to_device(child, device, dtype, memory_format)
+                move_to_device(child, moe, device, dtype, memory_format)
     return functools.partial(move_to_device, module=module, moe=moe_device)
 
 
@@ -129,14 +129,15 @@ class SegMoEPipeline:
         config_or_path: Path to Config or Directory containing SegMoE checkpoint or HF Card of SegMoE Checkpoint.
 
         Other Keyword Arguments:
-        torch_dtype: Data Type to load the pipeline in. (Default: torch.float16)
+        torch_dtype: Data Type to load the pipeline in. (Default: torch.bfloat16)
         variant: Variant of the Model. (Default: fp16)
         device: Device to load the model on. (Default: cuda)
+        offload: Whether to offload MoEs and load them on-device only when needed. (Default: false)
         Other args supported by diffusers.DiffusionPipeline are also supported.
 
         For more details visit https://github.com/segmind/segmoe.
         """
-        self.torch_dtype = kwargs.pop("torch_dtype", torch.float16)
+        self.torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)  # use bf16 instead of fp16 for increased base precision
         self.use_safetensors = kwargs.pop("use_safetensors", True)
         self.variant = kwargs.pop("variant", "fp16")
         self.offload_moe = kwargs.pop("offload", False)
@@ -160,6 +161,7 @@ class SegMoEPipeline:
                 self.base_cls = StableDiffusionPipeline
             else:
                 raise NotImplementedError("Base class not yet supported, type should be one of ['sd','sdxl]")
+            unet.to = move(unet, "cpu" if self.offloaded_moe else self.device)
             self.pipe = self.base_cls.from_pretrained(
                 cached_folder,
                 unet=unet,
@@ -168,11 +170,6 @@ class SegMoEPipeline:
                 **kwargs
             )
             self.pipe.to(self.device)
-            self.pipe.unet.to(
-                device=self.device,
-                dtype=self.torch_dtype,
-                memory_format=torch.channels_last,
-            )
 
     def load_from_scratch(self, config: str, **kwargs) -> None:
         # Load Config
