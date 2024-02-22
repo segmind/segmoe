@@ -1,23 +1,53 @@
 import gc
+import json
+import os
+from collections import OrderedDict
+from copy import deepcopy
+from math import ceil
+from typing import Any, Callable, Dict
+
+from cachetools import cached, LRUCache
+import safetensors
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers import (
-    DiffusionPipeline,
-    StableDiffusionPipeline,
-    StableDiffusionXLPipeline,
-    DDPMScheduler,
-    UNet2DConditionModel,
-)
 import tqdm
 import yaml
-from collections import OrderedDict
-from typing import Any, Dict, Callable
-import os
-from copy import deepcopy
-from math import ceil
-import json
-import safetensors
+from diffusers import (DDPMScheduler, DiffusionPipeline,
+                       StableDiffusionPipeline, StableDiffusionXLPipeline,
+                       UNet2DConditionModel)
+
+
+class EvictingLRUCache(LRUCache):
+    def __init__(self, maxsize, getsizeof=None):
+        LRUCache.__init__(self, maxsize, getsizeof)
+
+    def popitem(self):
+        key, val = LRUCache.popitem(self)
+        val.to("cpu")  # type: ignore
+        return key, val
+
+
+@cached(cache=EvictingLRUCache(maxsize=100))
+def move_expert(moe, device: torch.device):
+    moe.to(device)
+    return moe
+
+
+def move(pipe, device, moe_device):
+    def move_to_device(module):
+        if isinstance(module, SparseMoeBlock):
+            module.to(moe_device)
+        else:
+            module.to(device)
+            for child in module.children():
+                move_to_device(child)
+
+    move_to_device(pipe.text_encoder)
+    if hasattr(pipe, "text_encoder_2"):
+        move_to_device(pipe.text_encoder_2)
+    move_to_device(pipe.unet)
+    move_to_device(pipe.vae)
 
 
 def remove_all_forward_hooks(model: torch.nn.Module) -> None:
@@ -35,6 +65,7 @@ class SparseMoeBlock(nn.Module):
         self.hidden_dim = config["hidden_size"]
         self.num_experts = config["num_local_experts"]
         self.top_k = config["num_experts_per_tok"]
+        self._device = config.get("device", None)
         self.out_dim = config.get("out_dim", self.hidden_dim)
 
         # gating
@@ -65,6 +96,9 @@ class SparseMoeBlock(nn.Module):
         # Loop over all available experts in the model and perform the computation on each expert
         for i, expert_idx in enumerate(selected_experts[0].tolist()):
             expert_layer = self.experts[expert_idx]
+
+            if self._device is not None:
+                expert_layer = move_expert(expert_layer, self._device)
 
             current_hidden_states = routing_weights[:, i].view(
                 batch_size * sequence_length, -1
@@ -109,6 +143,7 @@ class SegMoEPipeline:
         self.torch_dtype = kwargs.pop("torch_dtype", torch.float16)
         self.use_safetensors = kwargs.pop("use_safetensors", True)
         self.variant = kwargs.pop("variant", "fp16")
+        self.offload_moe = kwargs.pop("offload", False)
         self.device = kwargs.pop("device", "cuda")
         if os.path.isfile(config_or_path):
             self.load_from_scratch(config_or_path, **kwargs)
