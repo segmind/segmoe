@@ -5,6 +5,7 @@ from collections import OrderedDict
 from copy import deepcopy
 from math import ceil
 from typing import Any, Callable, Dict
+import functools
 
 from cachetools import cached, LRUCache
 import safetensors
@@ -34,20 +35,15 @@ def move_expert(moe, device: torch.device):
     return moe
 
 
-def move(pipe, device, moe_device):
-    def move_to_device(module):
+def move(module, moe_device):
+    def move_to_device(module, moe, device, dtype=torch.bfloat16, memory_format=torch.channels_last):
         if isinstance(module, SparseMoeBlock):
-            module.to(moe_device)
+            module.to(device=moe, dtype=dtype, memory_format=memory_format)
         else:
-            module.to(device)
+            module.to(device=device, dtype=dtype, memory_format=memory_format)
             for child in module.children():
-                move_to_device(child)
-
-    move_to_device(pipe.text_encoder)
-    if hasattr(pipe, "text_encoder_2"):
-        move_to_device(pipe.text_encoder_2)
-    move_to_device(pipe.unet)
-    move_to_device(pipe.vae)
+                move_to_device(child, device, dtype, memory_format)
+    return functools.partial(move_to_device, module=module, moe=moe_device)
 
 
 def remove_all_forward_hooks(model: torch.nn.Module) -> None:
