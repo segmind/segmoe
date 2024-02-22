@@ -4,11 +4,9 @@ import os
 from collections import OrderedDict
 from copy import deepcopy
 from math import ceil
-from typing import Any, Callable, Dict
-import functools
 
-from cachetools import cached, LRUCache
-import safetensors
+from cachetools import LRUCache
+import safetensors.torch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,37 +18,39 @@ from diffusers import (DDPMScheduler, DiffusionPipeline,
 
 
 class EvictingLRUCache(LRUCache):
-    def __init__(self, maxsize, getsizeof=None):
+    def __init__(self, maxsize, device, getsizeof=None):
         LRUCache.__init__(self, maxsize, getsizeof)
+        self.device = device
 
     def popitem(self):
         key, val = LRUCache.popitem(self)
-        val.to("cpu")  # type: ignore
+        key.to("cpu")  # type: ignore
         return key, val
+    
+    def __setitem__(self, key, value, *args, **kwargs):
+        LRUCache.__setitem__(self, key, value, *args, **kwargs)
+        key.to(self.device)  # type: ignore
 
 
-@cached(cache=EvictingLRUCache(maxsize=100))
-def move_expert(moe, device: torch.device):
-    moe.to(device)
-    return moe
-
-
-def move(module, moe_device):
-    def move_to_device(module, moe, device, dtype=torch.bfloat16, memory_format=torch.channels_last):
-        if isinstance(module, SparseMoeBlock):
-            module.to(device=moe, dtype=dtype, memory_format=memory_format)
-        else:
-            module.to(device=device, dtype=dtype, memory_format=memory_format)
-            for child in module.children():
-                move_to_device(child, moe, device, dtype, memory_format)
-    return functools.partial(move_to_device, module=module, moe=moe_device)
+def move(modul, moe_device):
+    def move_to_device(device: torch.device, dtype: torch.dtype = torch.bfloat16, memory_format: torch.memory_format = torch.channels_last):
+        def _move(module, moe: torch.device, device: torch.device, dtype: torch.dtype = torch.bfloat16, memory_format: torch.memory_format = torch.channels_last):
+            if isinstance(module, SparseMoeBlock):
+                module.to(device=moe, dtype=dtype, memory_format=memory_format)  # type: ignore
+            else:
+                module.to(device=device, dtype=dtype, memory_format=memory_format)
+                for child in module.children():
+                    _move(child, moe, device, dtype, memory_format)
+        for child in modul.children():
+            _move(child, moe_device, device, dtype, memory_format)
+    return move_to_device
 
 
 def remove_all_forward_hooks(model: torch.nn.Module) -> None:
     for name, child in model._modules.items():
         if child is not None:
             if hasattr(child, "_forward_hooks"):
-                child._forward_hooks: Dict[int, Callable] = OrderedDict()
+                child._forward_hooks = OrderedDict()
             remove_all_forward_hooks(child)
 
 
@@ -61,7 +61,7 @@ class SparseMoeBlock(nn.Module):
         self.hidden_dim = config["hidden_size"]
         self.num_experts = config["num_local_experts"]
         self.top_k = config["num_experts_per_tok"]
-        self._device = config.get("device", None)
+        self.move = config.get("move_fn", lambda _: _)
         self.out_dim = config.get("out_dim", self.hidden_dim)
 
         # gating
@@ -71,6 +71,9 @@ class SparseMoeBlock(nn.Module):
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         batch_size, sequence_length, f_map_sz = hidden_states.shape
         hidden_states = hidden_states.view(-1, f_map_sz)
+
+        self.move(self.gate)
+
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
         _, selected_experts = torch.topk(
@@ -93,8 +96,7 @@ class SparseMoeBlock(nn.Module):
         for i, expert_idx in enumerate(selected_experts[0].tolist()):
             expert_layer = self.experts[expert_idx]
 
-            if self._device is not None:
-                expert_layer = move_expert(expert_layer, self._device)
+            expert_layer = self.move(expert_layer)
 
             current_hidden_states = routing_weights[:, i].view(
                 batch_size * sequence_length, -1
@@ -117,7 +119,7 @@ def getActivation(activation, name):
 
 
 class SegMoEPipeline:
-    def __init__(self, config_or_path, **kwargs) -> Any:
+    def __init__(self, config_or_path, **kwargs) -> None:
         """
         Instantiates the SegMoEPipeline. SegMoEPipeline implements the Segmind Mixture of Diffusion Experts, efficiently combining Stable Diffusion and Stable Diffusion Xl models.
 
@@ -132,7 +134,7 @@ class SegMoEPipeline:
         torch_dtype: Data Type to load the pipeline in. (Default: torch.bfloat16)
         variant: Variant of the Model. (Default: fp16)
         device: Device to load the model on. (Default: cuda)
-        offload: Whether to offload MoEs and load them on-device only when needed. (Default: false)
+        on_device_layers: How many layers to keep on device, '-1' for all layers. (Default: -1)
         Other args supported by diffusers.DiffusionPipeline are also supported.
 
         For more details visit https://github.com/segmind/segmoe.
@@ -140,8 +142,17 @@ class SegMoEPipeline:
         self.torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)  # use bf16 instead of fp16 for increased base precision
         self.use_safetensors = kwargs.pop("use_safetensors", True)
         self.variant = kwargs.pop("variant", "fp16")
-        self.offload_moe = kwargs.pop("offload", False)
+        self.offload_layer = kwargs.pop("on_device_layers", -1)
         self.device = kwargs.pop("device", "cuda")
+        self.config: dict
+        if self.offload_layer != -1:
+            self.offload_cache = EvictingLRUCache(self.offload_layer, self.device)
+            def move_fn(module: nn.Module):
+                self.offload_cache[module] = None
+                return module
+            self.move_fn = move_fn
+        else:
+            self.move_fn = lambda _: _
         if os.path.isfile(config_or_path):
             self.load_from_scratch(config_or_path, **kwargs)
         else:
@@ -161,7 +172,8 @@ class SegMoEPipeline:
                 self.base_cls = StableDiffusionPipeline
             else:
                 raise NotImplementedError("Base class not yet supported, type should be one of ['sd','sdxl]")
-            unet.to = move(unet, "cpu" if self.offloaded_moe else self.device)
+            if self.offload_layer != -1:
+                unet.to = move(unet, "cpu")  # type: ignore
             self.pipe = self.base_cls.from_pretrained(
                 cached_folder,
                 unet=unet,
@@ -170,11 +182,16 @@ class SegMoEPipeline:
                 **kwargs
             )
             self.pipe.to(self.device)
+            self.pipe.unet.to(
+                device=self.device,
+                dtype=self.torch_dtype,
+                memory_format=torch.channels_last,
+            )
 
-    def load_from_scratch(self, config: str, **kwargs) -> None:
+    def load_from_scratch(self, config: str, **kwargs) -> None:  # type: ignore
         # Load Config
         with open(config, "r") as f:
-            config = yaml.load(f, Loader=yaml.SafeLoader)
+            config: dict = yaml.load(f, Loader=yaml.SafeLoader)
         self.config = config
         if self.config.get("num_experts", None):
             self.num_experts = self.config["num_experts"]
@@ -917,19 +934,19 @@ class SegMoEPipeline:
         gc.collect()
         torch.cuda.empty_cache()
 
-    def __call__(self, *args: Any, **kwds: Any) -> Any:
+    def __call__(self, *args, **kwargs) -> None:
         """
         Inference the SegMoEPipeline.
 
         Calls diffusers.DiffusionPipeline forward with the keyword arguments. See https://github.com/segmind/segmoe#usage for detailed usage.
         """
-        return self.pipe(*args, **kwds)
+        return self.pipe(*args, **kwargs)  # type: ignore
 
     def create_empty(self, path):
         with open(f"{path}/unet/config.json") as f:
             config = json.load(f)
         self.config = config["segmoe_config"]
-        unet = UNet2DConditionModel.from_config(config)
+        unet: UNet2DConditionModel = UNet2DConditionModel.from_config(config)  # type: ignore
         num_experts_per_tok = self.config["num_experts_per_tok"]
         num_experts = self.config["num_experts"]
         moe_layers = self.config["moe_layers"]
@@ -945,9 +962,10 @@ class SegMoEPipeline:
         config_base = {
             "num_experts_per_tok": num_experts_per_tok,
             "num_local_experts": num_experts,
+            "move_fn": self.move_fn,
         }
 
-        for _, block in all_blocks:
+        for _, block in self.all_blocks:
             for attention in block.attentions:
                 for transformer in attention.transformer_blocks:
                     if moe_layers != "attn":
@@ -1057,6 +1075,7 @@ class SegMoEPipeline:
         negative,
     ):
         gate_vects = {}
+        hidden_states = []
         for i, expert in enumerate(tqdm.tqdm(experts, desc="Expert Prompts")):
             expert.to(self.device)
             expert.unet.to(
