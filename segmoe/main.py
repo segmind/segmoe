@@ -33,16 +33,16 @@ class EvictingLRUCache(LRUCache):
 
 
 def move(modul, moe_device):
-    def move_to_device(device: torch.device, dtype: torch.dtype = torch.bfloat16, memory_format: torch.memory_format = torch.channels_last):
-        def _move(module, moe: torch.device, device: torch.device, dtype: torch.dtype = torch.bfloat16, memory_format: torch.memory_format = torch.channels_last):
+    def move_to_device(device: torch.device, *args, **kwargs):
+        def _move(module, moe: torch.device, device: torch.device, *args, **kwargs):
             if isinstance(module, SparseMoeBlock):
-                module.to(device=moe, dtype=dtype, memory_format=memory_format)  # type: ignore
+                module.to(device=moe, *args, **kwargs)  # type: ignore
             else:
-                module.to(device=device, dtype=dtype, memory_format=memory_format)
+                module.to(device=device, **kwargs)
                 for child in module.children():
-                    _move(child, moe, device, dtype, memory_format)
+                    _move(child, moe, device, *args, **kwargs)
         for child in modul.children():
-            _move(child, moe_device, device, dtype, memory_format)
+            _move(child, moe_device, device, *args, **kwargs)
     return move_to_device
 
 
