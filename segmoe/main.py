@@ -131,7 +131,7 @@ class SegMoEPipeline:
         config_or_path: Path to Config or Directory containing SegMoE checkpoint or HF Card of SegMoE Checkpoint.
 
         Other Keyword Arguments:
-        torch_dtype: Data Type to load the pipeline in. (Default: torch.bfloat16)
+        torch_dtype: Data Type to load the pipeline in. (Default: torch.float16)
         variant: Variant of the Model. (Default: fp16)
         device: Device to load the model on. (Default: cuda)
         on_device_layers: How many layers to keep on device, '-1' for all layers. (Default: -1)
@@ -139,7 +139,7 @@ class SegMoEPipeline:
 
         For more details visit https://github.com/segmind/segmoe.
         """
-        self.torch_dtype = kwargs.pop("torch_dtype", torch.bfloat16)  # use bf16 instead of fp16 for increased base precision
+        self.torch_dtype = kwargs.pop("torch_dtype", torch.float16)
         self.use_safetensors = kwargs.pop("use_safetensors", True)
         self.variant = kwargs.pop("variant", "fp16")
         self.offload_layer = kwargs.pop("on_device_layers", -1)
