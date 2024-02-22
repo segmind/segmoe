@@ -9,7 +9,6 @@ from cachetools import LRUCache
 import safetensors.torch
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import tqdm
 import yaml
 from diffusers import (DDPMScheduler, DiffusionPipeline,
@@ -33,16 +32,16 @@ class EvictingLRUCache(LRUCache):
 
 
 def move(modul, moe_device):
-    def move_to_device(device: torch.device, *args, **kwargs):
-        def _move(module, moe: torch.device, device: torch.device, *args, **kwargs):
+    def move_to_device(device: torch.device, dtype: torch.dtype = torch.float16, memory_format: torch.memory_format = torch.channels_last):
+        def _move(module, moe: torch.device, device: torch.device, dtype: torch.dtype = torch.float16, memory_format: torch.memory_format = torch.channels_last):
             if isinstance(module, SparseMoeBlock):
-                module.to(device=moe, *args, **kwargs)  # type: ignore
+                module.to(device=moe, dtype=dtype, memory_format=memory_format)  # type: ignore
             else:
-                module.to(device=device, **kwargs)
+                module.to(device=device, dtype=dtype, memory_format=memory_format)
                 for child in module.children():
-                    _move(child, moe, device, *args, **kwargs)
+                    _move(child, moe, device, dtype, memory_format)
         for child in modul.children():
-            _move(child, moe_device, device, *args, **kwargs)
+            _move(child, moe_device, device, dtype, memory_format)
     return move_to_device
 
 
@@ -79,7 +78,7 @@ class SparseMoeBlock(nn.Module):
         _, selected_experts = torch.topk(
             router_logits.sum(dim=0, keepdim=True), self.top_k, dim=1
         )
-        routing_weights = F.softmax(
+        routing_weights = nn.functional.softmax(
             router_logits[:, selected_experts[0]], dim=1, dtype=torch.float
         )
 
