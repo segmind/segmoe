@@ -322,7 +322,7 @@ class SegMoEPipeline:
                 ):
                     try:
                         self.download_url(
-                            f"expert_{i}/model.safetensors", self.config["base_model"]
+                            f"expert_{i}/model.safetensors", exp["source_model"]
                         )
                         exp["source_model"] = f"expert_{i}/model.safetensors"
                         expert = self.base_cls.from_single_file(
@@ -374,7 +374,7 @@ class SegMoEPipeline:
                             try:
                                 self.download_url(
                                     f"expert_{i}/lora_{i}/pytorch_lora_weights.safetensors",
-                                    self.config["base_model"],
+                                    lora["source_model"],
                                 )
                                 lora["source_model"] = f"expert_{j}/lora_{j}"
                                 expert.load_lora_weights(lora["source_model"])
@@ -401,7 +401,7 @@ class SegMoEPipeline:
                         try:
                             self.download_url(
                                 f"lora_{i}/pytorch_lora_weights.safetensors",
-                                self.config["base_model"],
+                                lora["source_model"],
                             )
                             lora["source_model"] = f"lora_{i}"
                             self.pipe.load_lora_weights(lora["source_model"])
@@ -435,7 +435,7 @@ class SegMoEPipeline:
                         try:
                             self.download_url(
                                 f"lora_{i}/pytorch_lora_weights.safetensors",
-                                self.config["base_model"],
+                                lora["source_model"],
                             )
                             lora["source_model"] = f"lora_{i}"
                             experts[j[i]].load_lora_weights(lora["source_model"])
