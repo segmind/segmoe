@@ -229,6 +229,7 @@ class SegMoEPipeline:
                 dtype=self.torch_dtype,
                 memory_format=torch.channels_last,
             )
+        torch.cuda.empty_cache()
 
     @classmethod
     def download_url(cls, file: str, url: str) -> None:
@@ -667,7 +668,9 @@ class SegMoEPipeline:
 
         Calls diffusers.DiffusionPipeline forward with the keyword arguments. See https://github.com/segmind/segmoe#usage for detailed usage.
         """
-        return self.pipe(*args, **kwargs)  # type: ignore
+        output = self.pipe(*args, **kwargs)  # type: ignore
+        torch.cuda.empty_cache()
+        return output
 
     def create_empty(self, path):
         with open(f"{path}/unet/config.json", "r") as f:
@@ -865,5 +868,5 @@ class SegMoEPipeline:
                 gate_vects[h], dim=0
             )  # (num_expert, num_layer, hidden_size)
             gate_vects[h].permute(1, 0)
-
+        torch.cuda.empty_cache()
         return gate_vects
