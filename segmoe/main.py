@@ -6,6 +6,7 @@ from collections import OrderedDict
 from copy import deepcopy
 from enum import Enum
 from math import ceil
+from typing import Union
 
 import safetensors.torch
 import torch
@@ -161,38 +162,17 @@ class SegMoEPipeline:
         self.torch_dtype = kwargs.pop("torch_dtype", torch.float16)
         self.use_safetensors = kwargs.pop("use_safetensors", True)
         self.variant = kwargs.pop("variant", "fp16")
-        self.offload_layer = kwargs.pop("on_device_layers", -1)
+        self.offload_layer = -1
         self.device = kwargs.pop("device", "cuda")
         self.scheduler = kwargs.pop("scheduler", DDPMScheduler)
         self.config: dict
 
-        if (isinstance(self.scheduler, str) and self.scheduler.isdigit()) or isinstance(
-            self.scheduler, (int, KarrasDiffusionSchedulers)
-        ):
-            if isinstance(self.scheduler, Enum):
-                self.scheduler = self.scheduler.value
-            scheduler = KarrasDiffusionSchedulers(int(self.scheduler))
-            try:
-                self.scheduler = getattr(
-                    importlib.import_module("diffusers"), scheduler.name
-                )
-            except AttributeError:
-                pass
-        elif isinstance(self.scheduler, str):
-            self.scheduler = getattr(
-                importlib.import_module("diffusers"), self.scheduler
-            )
+        self.pipe: DiffusionPipeline = None  # type: ignore
+        self.offload_cache: EvictingLRUCache = None  # type: ignore
 
-        if self.offload_layer != -1:
-            self.offload_cache = EvictingLRUCache(self.offload_layer, self.device)
+        self.on_device_layers = kwargs.pop("on_device_layers", self.offload_layer)
+        self.scheduler_class = self.scheduler
 
-            def move_fn(module: nn.Module):
-                self.offload_cache[module] = None
-                return module
-
-            self.move_fn = move_fn
-        else:
-            self.move_fn = lambda _: _
         if os.path.isfile(config_or_path):
             self.load_from_scratch(config_or_path, **kwargs)
         else:
@@ -232,6 +212,54 @@ class SegMoEPipeline:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    @property
+    def scheduler_class(self):
+        return self.scheduler
+
+    @scheduler_class.setter
+    def scheduler_class(self, value: Union[KarrasDiffusionSchedulers, int, str, Enum]):
+        if (isinstance(value, str) and value.isdigit()) or isinstance(
+            self.scheduler, (int, KarrasDiffusionSchedulers)
+        ):
+            if isinstance(value, Enum):
+                self.scheduler = value.value
+            scheduler = KarrasDiffusionSchedulers(int(value))  # type: ignore
+            try:
+                self.scheduler = getattr(
+                    importlib.import_module("diffusers"), scheduler.name
+                )
+            except AttributeError:
+                pass
+        elif isinstance(value, str):
+            self.scheduler = getattr(importlib.import_module("diffusers"), value)
+        else:
+            self.scheduler = value
+
+    @property
+    def on_device_layers(self):
+        return self.offload_layer
+
+    @on_device_layers.setter
+    def on_device_layers(self, value: int):
+        self.offload_layer = value
+        if self.offload_layer != -1:
+            if self.offload_cache is not None:
+                list(map(lambda x: x.to("cpu"), self.offload_cache.keys()))
+            self.offload_cache = EvictingLRUCache(self.offload_layer, self.device)
+
+            def move_fn(module: nn.Module):
+                self.offload_cache[module] = None
+                return module
+
+            self.move_fn = move_fn
+            if self.pipe is not None:
+                self.pipe.unet.to = move(self.pipe.unet, "cpu")  # type: ignore
+        else:
+            if self.pipe is not None:
+                self.pipe.unet.to = move(self.pipe.unet, self.device)  # type: ignore
+                self.pipe.unet.to(device=self.device)
+            self.move_fn = lambda _: _
+
     @classmethod
     def download_url(cls, file: str, url: str) -> None:
         os.makedirs(file.split("/")[0], exist_ok=True)
@@ -248,8 +276,12 @@ class SegMoEPipeline:
             len(self.config.get("experts", [])),
             len(self.config.get("loras", [])),
         )
-        self.config["base_model"] = self.config.get("base_model", self.config["experts"][0]["source_model"])
-        self.config["num_experts_per_tok"] = num_experts_per_tok = self.config.get("num_experts_per_tok", 1)
+        self.config["base_model"] = self.config.get(
+            "base_model", self.config["experts"][0]["source_model"]
+        )
+        self.config["num_experts_per_tok"] = num_experts_per_tok = self.config.get(
+            "num_experts_per_tok", 1
+        )
         self.config["moe_layers"] = moe_layers = self.config.get("moe_layers", "attn")
         self.config["type"] = self.config.get("type", "sdxl")
         if self.config["type"] == "sdxl":
