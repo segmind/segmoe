@@ -229,7 +229,8 @@ class SegMoEPipeline:
                 dtype=self.torch_dtype,
                 memory_format=torch.channels_last,
             )
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     @classmethod
     def download_url(cls, file: str, url: str) -> None:
@@ -247,8 +248,8 @@ class SegMoEPipeline:
             len(self.config.get("experts", [])),
             len(self.config.get("loras", [])),
         )
-        num_experts_per_tok = self.config.get("num_experts_per_tok", 1)
-        self.config["num_experts_per_tok"] = num_experts_per_tok
+        self.config["base_model"] = self.config.get("base_model", self.config["experts"][0]["source_model"])
+        self.config["num_experts_per_tok"] = num_experts_per_tok = self.config.get("num_experts_per_tok", 1)
         self.config["moe_layers"] = moe_layers = self.config.get("moe_layers", "attn")
         self.config["type"] = self.config.get("type", "sdxl")
         if self.config["type"] == "sdxl":
@@ -261,10 +262,6 @@ class SegMoEPipeline:
             )
 
         # Load Base Model
-        assert (
-            self.config.get("base_model", None) is not None
-        ), "Base Model not found in Config"
-
         if self.config["base_model"].startswith(
             "https://civitai.com/api/download/models/"
         ):
@@ -669,7 +666,8 @@ class SegMoEPipeline:
         Calls diffusers.DiffusionPipeline forward with the keyword arguments. See https://github.com/segmind/segmoe#usage for detailed usage.
         """
         output = self.pipe(*args, **kwargs)  # type: ignore
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return output
 
     def create_empty(self, path):
@@ -832,7 +830,8 @@ class SegMoEPipeline:
             hidden[key] = hidden_states.to(self.device)
         del intermediate
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return hidden
 
     @torch.no_grad
@@ -868,5 +867,6 @@ class SegMoEPipeline:
                 gate_vects[h], dim=0
             )  # (num_expert, num_layer, hidden_size)
             gate_vects[h].permute(1, 0)
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return gate_vects
