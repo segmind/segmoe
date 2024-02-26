@@ -39,7 +39,7 @@ class EvictingLRUCache(LRUCache):
         key.to(self.device)  # type: ignore
 
 
-def move(modul, moe_device):
+def move(modul, moe_device, move_fn):
     def move_to_device(
         device: torch.device,
         dtype: torch.dtype = torch.float16,
@@ -53,6 +53,7 @@ def move(modul, moe_device):
             memory_format: torch.memory_format = torch.channels_last,
         ):
             if isinstance(module, SparseMoeBlock):
+                module.move = move_fn
                 module.to(device=moe, dtype=dtype, memory_format=memory_format)  # type: ignore
             else:
                 module.to(device=device, dtype=dtype, memory_format=memory_format)
@@ -252,13 +253,13 @@ class SegMoEPipeline:
                 return module
 
             self.move_fn = move_fn
-            if self.pipe is not None:
-                self.pipe.unet.to = move(self.pipe.unet, "cpu")  # type: ignore
+            offload_device = "cpu"
         else:
-            if self.pipe is not None:
-                self.pipe.unet.to = move(self.pipe.unet, self.device)  # type: ignore
-                self.pipe.unet.to(device=self.device)
+            offload_device = self.device
             self.move_fn = lambda _: _
+        if self.pipe is not None:
+            self.pipe.unet.to = move(self.pipe.unet, offload_device, self.move_fn)  # type: ignore
+            self.pipe.unet.to(device=self.device)
 
     @classmethod
     def download_url(cls, file: str, url: str) -> None:
