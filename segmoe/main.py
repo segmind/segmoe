@@ -196,7 +196,7 @@ class SegMoEPipeline:
                     "Base class not yet supported, type should be one of ['sd','sdxl]"
                 )
             if self.offload_layer != -1:
-                unet.to = move(unet, "cpu")  # type: ignore
+                unet.to = move(unet, "cpu", self.move_fn)  # type: ignore
             self.pipe = self.base_cls.from_pretrained(
                 cached_folder,
                 unet=unet,
