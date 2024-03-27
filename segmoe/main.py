@@ -1,30 +1,76 @@
 import gc
+import importlib
+import json
+import os
+from collections import OrderedDict
+from copy import deepcopy
+from enum import Enum
+from math import ceil
+from typing import Union
+
+import safetensors.torch
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import tqdm
+import yaml
+from cachetools import LRUCache
 from diffusers import (
+    DDPMScheduler,
     DiffusionPipeline,
     StableDiffusionPipeline,
     StableDiffusionXLPipeline,
-    DDPMScheduler,
     UNet2DConditionModel,
 )
-import tqdm
-import yaml
-from collections import OrderedDict
-from typing import Any, Dict, Callable
-import os
-from copy import deepcopy
-from math import ceil
-import json
-import safetensors
+from diffusers.schedulers.scheduling_utils import KarrasDiffusionSchedulers
+
+
+class EvictingLRUCache(LRUCache):
+    def __init__(self, maxsize, device, getsizeof=None):
+        LRUCache.__init__(self, maxsize, getsizeof)
+        self.device = device
+
+    def popitem(self):
+        key, val = LRUCache.popitem(self)
+        key.to("cpu")  # type: ignore
+        return key, val
+
+    def __setitem__(self, key, value, *args, **kwargs):
+        LRUCache.__setitem__(self, key, value, *args, **kwargs)
+        key.to(self.device)  # type: ignore
+
+
+def move(modul, moe_device, move_fn):
+    def move_to_device(
+        device: torch.device,
+        dtype: torch.dtype = torch.float16,
+        memory_format: torch.memory_format = torch.channels_last,
+    ):
+        def _move(
+            module,
+            moe: torch.device,
+            device: torch.device,
+            dtype: torch.dtype = torch.float16,
+            memory_format: torch.memory_format = torch.channels_last,
+        ):
+            if isinstance(module, SparseMoeBlock):
+                module.move = move_fn
+                module.to(device=moe, dtype=dtype, memory_format=memory_format)  # type: ignore
+            else:
+                module.to(device=device, dtype=dtype, memory_format=memory_format)
+                for child in module.children():
+                    _move(child, moe, device, dtype, memory_format)
+
+        for child in modul.children():
+            _move(child, moe_device, device, dtype, memory_format)
+
+    return move_to_device
 
 
 def remove_all_forward_hooks(model: torch.nn.Module) -> None:
     for name, child in model._modules.items():
         if child is not None:
             if hasattr(child, "_forward_hooks"):
-                child._forward_hooks: Dict[int, Callable] = OrderedDict()
+                child._forward_hooks = OrderedDict()
             remove_all_forward_hooks(child)
 
 
@@ -35,6 +81,7 @@ class SparseMoeBlock(nn.Module):
         self.hidden_dim = config["hidden_size"]
         self.num_experts = config["num_local_experts"]
         self.top_k = config["num_experts_per_tok"]
+        self.move = config.get("move_fn", lambda _: _)
         self.out_dim = config.get("out_dim", self.hidden_dim)
 
         # gating
@@ -44,12 +91,15 @@ class SparseMoeBlock(nn.Module):
     def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         batch_size, sequence_length, f_map_sz = hidden_states.shape
         hidden_states = hidden_states.view(-1, f_map_sz)
+
+        self.move(self.gate)
+
         # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
         _, selected_experts = torch.topk(
             router_logits.sum(dim=0, keepdim=True), self.top_k, dim=1
         )
-        routing_weights = F.softmax(
+        routing_weights = nn.functional.softmax(
             router_logits[:, selected_experts[0]], dim=1, dtype=torch.float
         )
 
@@ -65,6 +115,8 @@ class SparseMoeBlock(nn.Module):
         # Loop over all available experts in the model and perform the computation on each expert
         for i, expert_idx in enumerate(selected_experts[0].tolist()):
             expert_layer = self.experts[expert_idx]
+
+            expert_layer = self.move(expert_layer)
 
             current_hidden_states = routing_weights[:, i].view(
                 batch_size * sequence_length, -1
@@ -87,7 +139,7 @@ def getActivation(activation, name):
 
 
 class SegMoEPipeline:
-    def __init__(self, config_or_path, **kwargs) -> Any:
+    def __init__(self, config_or_path, **kwargs) -> None:
         """
         Instantiates the SegMoEPipeline. SegMoEPipeline implements the Segmind Mixture of Diffusion Experts, efficiently combining Stable Diffusion and Stable Diffusion Xl models.
 
@@ -102,6 +154,8 @@ class SegMoEPipeline:
         torch_dtype: Data Type to load the pipeline in. (Default: torch.float16)
         variant: Variant of the Model. (Default: fp16)
         device: Device to load the model on. (Default: cuda)
+        on_device_layers: How many layers to keep on device, '-1' for all layers. (Default: -1)
+        scheduler: Which scheduler to use for sampling. (Default: DDPMScheduler)
         Other args supported by diffusers.DiffusionPipeline are also supported.
 
         For more details visit https://github.com/segmind/segmoe.
@@ -109,7 +163,17 @@ class SegMoEPipeline:
         self.torch_dtype = kwargs.pop("torch_dtype", torch.float16)
         self.use_safetensors = kwargs.pop("use_safetensors", True)
         self.variant = kwargs.pop("variant", "fp16")
+        self.offload_layer = -1
         self.device = kwargs.pop("device", "cuda")
+        self.scheduler = kwargs.pop("scheduler", DDPMScheduler)
+        self.config: dict
+
+        self.pipe: DiffusionPipeline = None  # type: ignore
+        self.offload_cache: EvictingLRUCache = None  # type: ignore
+
+        self.on_device_layers = kwargs.pop("on_device_layers", self.offload_layer)
+        self.scheduler_class = self.scheduler
+
         if os.path.isfile(config_or_path):
             self.load_from_scratch(config_or_path, **kwargs)
         else:
@@ -128,13 +192,17 @@ class SegMoEPipeline:
             elif self.config.get("type", "sdxl") == "sd":
                 self.base_cls = StableDiffusionPipeline
             else:
-                raise NotImplementedError("Base class not yet supported, type should be one of ['sd','sdxl]")
+                raise NotImplementedError(
+                    "Base class not yet supported, type should be one of ['sd','sdxl]"
+                )
+            if self.offload_layer != -1:
+                unet.to = move(unet, "cpu", self.move_fn)  # type: ignore
             self.pipe = self.base_cls.from_pretrained(
                 cached_folder,
                 unet=unet,
                 torch_dtype=self.torch_dtype,
                 use_safetensors=self.use_safetensors,
-                **kwargs
+                **kwargs,
             )
             self.pipe.to(self.device)
             self.pipe.unet.to(
@@ -142,46 +210,95 @@ class SegMoEPipeline:
                 dtype=self.torch_dtype,
                 memory_format=torch.channels_last,
             )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    def load_from_scratch(self, config: str, **kwargs) -> None:
+    @property
+    def scheduler_class(self):
+        return self.scheduler
+
+    @scheduler_class.setter
+    def scheduler_class(self, value: Union[KarrasDiffusionSchedulers, int, str, Enum]):
+        if (isinstance(value, str) and value.isdigit()) or isinstance(
+            self.scheduler, (int, KarrasDiffusionSchedulers)
+        ):
+            if isinstance(value, Enum):
+                self.scheduler = value.value
+            scheduler = KarrasDiffusionSchedulers(int(value))  # type: ignore
+            try:
+                self.scheduler = getattr(
+                    importlib.import_module("diffusers"), scheduler.name
+                )
+            except AttributeError:
+                pass
+        elif isinstance(value, str):
+            self.scheduler = getattr(importlib.import_module("diffusers"), value)
+        else:
+            self.scheduler = value
+
+    @property
+    def on_device_layers(self):
+        return self.offload_layer
+
+    @on_device_layers.setter
+    def on_device_layers(self, value: int):
+        self.offload_layer = value
+        if self.offload_layer != -1:
+            if self.offload_cache is not None:
+                list(map(lambda x: x.to("cpu"), self.offload_cache.keys()))
+            self.offload_cache = EvictingLRUCache(self.offload_layer, self.device)
+
+            def move_fn(module: nn.Module):
+                self.offload_cache[module] = None
+                return module
+
+            self.move_fn = move_fn
+            offload_device = "cpu"
+        else:
+            offload_device = self.device
+            self.move_fn = lambda _: _
+        if self.pipe is not None:
+            self.pipe.unet.to = move(self.pipe.unet, offload_device, self.move_fn)  # type: ignore
+            self.pipe.unet.to(device=self.device)
+
+    @classmethod
+    def download_url(cls, file: str, url: str) -> None:
+        os.makedirs(file.split("/")[0], exist_ok=True)
+        if not os.path.isfile(file):
+            os.system(f"wget {url} -O {file} --content-disposition")
+
+    def load_from_scratch(self, config: str, **kwargs) -> None:  # type: ignore
         # Load Config
         with open(config, "r") as f:
-            config = yaml.load(f, Loader=yaml.SafeLoader)
+            config: dict = yaml.load(f, Loader=yaml.SafeLoader)
         self.config = config
-        if self.config.get("num_experts", None):
-            self.num_experts = self.config["num_experts"]
-        else:
-            if self.config.get("experts", None):
-                self.num_experts = len(self.config["experts"])
-            else:
-                if self.config.get("loras", None):
-                    self.num_experts = len(self.config["loras"])
-                else:
-                    self.num_experts = 1
-        num_experts_per_tok = self.config.get("num_experts_per_tok", 1)
-        self.config["num_experts_per_tok"] = num_experts_per_tok
-        moe_layers = self.config.get("moe_layers", "attn")
-        self.config["moe_layers"] = moe_layers
-        if self.config.get("type", "sdxl") == "sdxl":
+        self.num_experts = max(
+            self.config.get("num_experts", 1),
+            len(self.config.get("experts", [])),
+            len(self.config.get("loras", [])),
+        )
+        self.config["base_model"] = self.config.get(
+            "base_model", self.config["experts"][0]["source_model"]
+        )
+        self.config["num_experts_per_tok"] = num_experts_per_tok = self.config.get(
+            "num_experts_per_tok", 1
+        )
+        self.config["moe_layers"] = moe_layers = self.config.get("moe_layers", "attn")
+        self.config["type"] = self.config.get("type", "sdxl")
+        if self.config["type"] == "sdxl":
             self.base_cls = StableDiffusionXLPipeline
-            self.config["type"] = "sdxl"
-        elif self.config.get("type", "sdxl") == "sd":
+        elif self.config["type"] == "sd":
             self.base_cls = StableDiffusionPipeline
-            self.config["type"] = "sd"
         else:
-            raise NotImplementedError("Base class not yet supported, type should be one of ['sd','sdxl]")
+            raise NotImplementedError(
+                f"Base class {self.config['type']} not supported yet: Type should be one of ['sd', 'sdxl]"
+            )
+
         # Load Base Model
         if self.config["base_model"].startswith(
             "https://civitai.com/api/download/models/"
         ):
-            os.makedirs("base", exist_ok=True)
-            if not os.path.isfile("base/model.safetensors"):
-                os.system(
-                    "wget -O "
-                    + "base/model.safetensors "
-                    + self.config["base_model"]
-                    + " --content-disposition"
-                )
+            self.download_url("base/model.safetensors", self.config["base_model"])
             self.config["base_model"] = "base/model.safetensors"
             self.pipe = self.base_cls.from_single_file(
                 self.config["base_model"], torch_dtype=self.torch_dtype
@@ -202,7 +319,7 @@ class SegMoEPipeline:
                     variant=self.variant,
                     **kwargs,
                 )
-            except:
+            except Exception:
                 self.pipe = self.base_cls.from_pretrained(
                     self.config["base_model"], torch_dtype=self.torch_dtype, **kwargs
                 )
@@ -221,8 +338,7 @@ class SegMoEPipeline:
         self.config["down_idx_start"] = self.down_idx_start
         self.config["down_idx_end"] = self.down_idx_end
 
-        # TODO: Add Support for Scheduler Selection
-        self.pipe.scheduler = DDPMScheduler.from_config(self.pipe.scheduler.config)
+        self.pipe.scheduler = self.scheduler.from_config(self.pipe.scheduler.config)  # type: ignore
 
         # Load Experts
         experts = []
@@ -236,14 +352,9 @@ class SegMoEPipeline:
                     "https://civitai.com/api/download/models/"
                 ):
                     try:
-                        if not os.path.isfile(f"expert_{i}/model.safetensors"):
-                            os.makedirs(f"expert_{i}", exist_ok=True)
-                            if not os.path.isfile(f"expert_{i}/model.safetensors"):
-                                os.system(
-                                    f"wget {exp['source_model']} -O "
-                                    + f"expert_{i}/model.safetensors "
-                                    + " --content-disposition"
-                                )
+                        self.download_url(
+                            f"expert_{i}/model.safetensors", exp["source_model"]
+                        )
                         exp["source_model"] = f"expert_{i}/model.safetensors"
                         expert = self.base_cls.from_single_file(
                             exp["source_model"], **kwargs
@@ -259,7 +370,7 @@ class SegMoEPipeline:
                         variant=self.variant,
                         **kwargs,
                     )
-                    expert.scheduler = DDPMScheduler.from_config(
+                    expert.scheduler = self.scheduler.from_config(  # type: ignore
                         expert.scheduler.config
                     )
                 else:
@@ -272,15 +383,14 @@ class SegMoEPipeline:
                             **kwargs,
                         )
 
-                        # TODO: Add Support for Scheduler Selection
-                        expert.scheduler = DDPMScheduler.from_config(
+                        expert.scheduler = self.scheduler.from_config(  # type: ignore
                             expert.scheduler.config
                         )
-                    except:
+                    except Exception:
                         expert = self.base_cls.from_pretrained(
                             exp["source_model"], torch_dtype=self.torch_dtype, **kwargs
                         )
-                        expert.scheduler = DDPMScheduler.from_config(
+                        expert.scheduler = self.scheduler.from_config(  # type: ignore
                             expert.scheduler.config
                         )
                 if exp.get("loras", None):
@@ -293,15 +403,10 @@ class SegMoEPipeline:
                             "https://civitai.com/api/download/models/"
                         ):
                             try:
-                                os.makedirs(f"expert_{i}/lora_{i}", exist_ok=True)
-                                if not os.path.isfile(
-                                    f"expert_{i}/lora_{i}/pytorch_lora_weights.safetensors"
-                                ):
-                                    os.system(
-                                        f"wget {lora['source_model']} -O "
-                                        + f"expert_{i}/lora_{j}/pytorch_lora_weights.safetensors"
-                                        + " --content-disposition"
-                                    )
+                                self.download_url(
+                                    f"expert_{i}/lora_{i}/pytorch_lora_weights.safetensors",
+                                    lora["source_model"],
+                                )
                                 lora["source_model"] = f"expert_{j}/lora_{j}"
                                 expert.load_lora_weights(lora["source_model"])
                                 if len(exp["loras"]) == 1:
@@ -325,15 +430,10 @@ class SegMoEPipeline:
                         "https://civitai.com/api/download/models/"
                     ):
                         try:
-                            os.makedirs(f"lora_{i}", exist_ok=True)
-                            if not os.path.isfile(
-                                f"lora_{i}/pytorch_lora_weights.safetensors"
-                            ):
-                                os.system(
-                                    f"wget {lora['source_model']} -O "
-                                    + f"lora_{i}/pytorch_lora_weights.safetensors"
-                                    + " --content-disposition"
-                                )
+                            self.download_url(
+                                f"lora_{i}/pytorch_lora_weights.safetensors",
+                                lora["source_model"],
+                            )
                             lora["source_model"] = f"lora_{i}"
                             self.pipe.load_lora_weights(lora["source_model"])
                             if len(self.config["loras"]) == 1:
@@ -364,520 +464,222 @@ class SegMoEPipeline:
                         "https://civitai.com/api/download/models/"
                     ):
                         try:
-                            os.makedirs(f"lora_{i}", exist_ok=True)
-                            if not os.path.isfile(
-                                f"lora_{i}/pytorch_lora_weights.safetensors"
-                            ):
-                                os.system(
-                                    f"wget {lora['source_model']} -O "
-                                    + f"lora_{i}/pytorch_lora_weights.safetensors"
-                                    + " --content-disposition"
-                                )
+                            self.download_url(
+                                f"lora_{i}/pytorch_lora_weights.safetensors",
+                                lora["source_model"],
+                            )
                             lora["source_model"] = f"lora_{i}"
                             experts[j[i]].load_lora_weights(lora["source_model"])
                             experts[j[i]].fuse_lora()
-                        except:
+                        except Exception:
                             print(f"LoRA {i} {lora['source_model']} failed to load")
                     else:
                         experts[j[i]].load_lora_weights(lora["source_model"])
                         experts[j[i]].fuse_lora()
 
+        down_blocks = list(
+            map(
+                lambda i: (i, ("d", self.pipe.unet.down_blocks[i])),
+                range(self.down_idx_start, self.down_idx_end),
+            )
+        )
+        up_blocks = list(
+            map(
+                lambda i: (i, ("u", self.pipe.unet.up_blocks[i])),
+                range(self.up_idx_start, self.up_idx_end),
+            )
+        )
+        self.all_blocks = down_blocks + up_blocks
+
+        config_base = {
+            "num_experts_per_tok": num_experts_per_tok,
+            "num_local_experts": len(experts),
+        }
+
         # Replace FF and Attention Layers with Sparse MoE Layers
-        for i in range(self.down_idx_start, self.down_idx_end):
-            for j in range(len(self.pipe.unet.down_blocks[i].attentions)):
-                for k in range(
-                    len(self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks)
-                ):
-                    if not moe_layers == "attn":
+        for i, (t, block) in self.all_blocks:
+            for j, attention in enumerate(block.attentions):
+                for k, transformer in enumerate(attention.transformer_blocks):
+                    if moe_layers != "attn":
                         config = {
-                            "hidden_size": next(
-                                self.pipe.unet.down_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .ff.parameters()
-                            ).size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(experts),
+                            "hidden_size": next(transformer.ff.parameters()).size()[-1],
+                            **config_base,
                         }
                         # FF Layers
-                        layers = []
-                        for l in range(len(experts)):
-                            layers.append(
-                                deepcopy(
-                                    experts[l]
-                                    .unet.down_blocks[i]
+                        layers = list(
+                            map(
+                                lambda expert: deepcopy(
+                                    (
+                                        expert.unet.down_blocks
+                                        if t == "d"
+                                        else expert.unet.up_blocks
+                                    )[i]
                                     .attentions[j]
                                     .transformer_blocks[k]
                                     .ff
-                                )
+                                ),
+                                experts,
                             )
-                        self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].ff = SparseMoeBlock(config, layers)
-                    if not moe_layers == "ff":
+                        )
+                        transformer.ff = SparseMoeBlock(config, layers)
+                    if moe_layers != "ff":
                         ## Attns
                         config = {
-                            "hidden_size": self.pipe.unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_q.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": self.num_experts,
+                            "hidden_size": transformer.attn1.to_q.weight.size()[-1],
+                            **config_base,
                         }
-                        layers = []
-                        for l in range(len(experts)):
-                            layers.append(
-                                deepcopy(
-                                    experts[l]
-                                    .unet.down_blocks[i]
+                        layers = list(
+                            map(
+                                lambda expert: deepcopy(
+                                    (
+                                        expert.unet.down_blocks
+                                        if t == "d"
+                                        else expert.unet.up_blocks
+                                    )[i]
                                     .attentions[j]
                                     .transformer_blocks[k]
                                     .attn1.to_q
-                                )
+                                ),
+                                experts,
                             )
-                        self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_q = SparseMoeBlock(config, layers)
+                        )
+                        transformer.attn1.to_q = SparseMoeBlock(config, layers)
 
-                        layers = []
-                        for l in range(len(experts)):
-                            layers.append(
-                                deepcopy(
-                                    experts[l]
-                                    .unet.down_blocks[i]
+                        layers = list(
+                            map(
+                                lambda expert: deepcopy(
+                                    (
+                                        expert.unet.down_blocks
+                                        if t == "d"
+                                        else expert.unet.up_blocks
+                                    )[i]
                                     .attentions[j]
                                     .transformer_blocks[k]
                                     .attn1.to_k
-                                )
+                                ),
+                                experts,
                             )
-                        self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_k = SparseMoeBlock(config, layers)
+                        )
+                        transformer.attn1.to_k = SparseMoeBlock(config, layers)
 
-                        layers = []
-                        for l in range(len(experts)):
-                            layers.append(
-                                deepcopy(
-                                    experts[l]
-                                    .unet.down_blocks[i]
+                        layers = list(
+                            map(
+                                lambda expert: deepcopy(
+                                    (
+                                        expert.unet.down_blocks
+                                        if t == "d"
+                                        else expert.unet.up_blocks
+                                    )[i]
                                     .attentions[j]
                                     .transformer_blocks[k]
                                     .attn1.to_v
-                                )
+                                ),
+                                experts,
                             )
-                        self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_v = SparseMoeBlock(config, layers)
+                        )
+                        transformer.attn1.to_v = SparseMoeBlock(config, layers)
 
                         config = {
-                            "hidden_size": self.pipe.unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_q.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(experts),
+                            "hidden_size": transformer.attn2.to_q.weight.size()[-1],
+                            **config_base,
                         }
-
-                        layers = []
-                        for l in range(len(experts)):
-                            layers.append(
-                                deepcopy(
-                                    experts[l]
-                                    .unet.down_blocks[i]
+                        layers = list(
+                            map(
+                                lambda expert: deepcopy(
+                                    (
+                                        expert.unet.down_blocks
+                                        if t == "d"
+                                        else expert.unet.up_blocks
+                                    )[i]
                                     .attentions[j]
                                     .transformer_blocks[k]
                                     .attn2.to_q
-                                )
+                                ),
+                                experts,
                             )
-                        self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_q = SparseMoeBlock(config, layers)
+                        )
+                        transformer.attn2.to_q = SparseMoeBlock(config, layers)
 
                         config = {
-                            "hidden_size": self.pipe.unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(experts),
-                            "out_dim": self.pipe.unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k.weight.size()[0],
+                            "hidden_size": transformer.attn2.to_k.weight.size()[-1],
+                            "out_dim": transformer.attn2.to_k.weight.size()[0],
+                            **config_base,
                         }
-                        layers = []
-                        for l in range(len(experts)):
-                            layers.append(
-                                deepcopy(
-                                    experts[l]
-                                    .unet.down_blocks[i]
+                        layers = list(
+                            map(
+                                lambda expert: deepcopy(
+                                    (
+                                        expert.unet.down_blocks
+                                        if t == "d"
+                                        else expert.unet.up_blocks
+                                    )[i]
                                     .attentions[j]
                                     .transformer_blocks[k]
                                     .attn2.to_k
-                                )
+                                ),
+                                experts,
                             )
-                        self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_k = SparseMoeBlock(config, layers)
+                        )
+                        transformer.attn2.to_k = SparseMoeBlock(config, layers)
 
                         config = {
-                            "hidden_size": self.pipe.unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v.weight.size()[-1],
-                            "out_dim": self.pipe.unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v.weight.size()[0],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(experts),
+                            "hidden_size": transformer.attn2.to_v.weight.size()[-1],
+                            "out_dim": transformer.attn2.to_v.weight.size()[0],
+                            **config_base,
                         }
-                        layers = []
-                        for l in range(len(experts)):
-                            layers.append(
-                                deepcopy(
-                                    experts[l]
-                                    .unet.down_blocks[i]
+                        layers = list(
+                            map(
+                                lambda expert: deepcopy(
+                                    (
+                                        expert.unet.down_blocks
+                                        if t == "d"
+                                        else expert.unet.up_blocks
+                                    )[i]
                                     .attentions[j]
                                     .transformer_blocks[k]
                                     .attn2.to_v
-                                )
+                                ),
+                                experts,
                             )
-                        self.pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_v = SparseMoeBlock(config, layers)
-
-        for i in range(self.up_idx_start, self.up_idx_end):
-            for j in range(len(self.pipe.unet.up_blocks[i].attentions)):
-                for k in range(
-                    len(self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks)
-                ):
-                    if not moe_layers == "attn":
-                        config = {
-                            "hidden_size": next(
-                                self.pipe.unet.up_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .ff.parameters()
-                            ).size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(experts),
-                        }
-                        # FF Layers
-                        layers = []
-                        for l in range(len(experts)):
-                            layers.append(
-                                deepcopy(
-                                    experts[l]
-                                    .unet.up_blocks[i]
-                                    .attentions[j]
-                                    .transformer_blocks[k]
-                                    .ff
-                                )
-                            )
-                        self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].ff = SparseMoeBlock(config, layers)
-
-                    if not moe_layers == "ff":
-                        # Attns
-                        config = {
-                            "hidden_size": self.pipe.unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_q.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(experts),
-                        }
-
-                        layers = []
-                        for l in range(len(experts)):
-                            layers.append(
-                                deepcopy(
-                                    experts[l]
-                                    .unet.up_blocks[i]
-                                    .attentions[j]
-                                    .transformer_blocks[k]
-                                    .attn1.to_q
-                                )
-                            )
-
-                        self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_q = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": self.pipe.unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_k.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(experts),
-                        }
-                        layers = []
-
-                        for l in range(len(experts)):
-                            layers.append(
-                                deepcopy(
-                                    experts[l]
-                                    .unet.up_blocks[i]
-                                    .attentions[j]
-                                    .transformer_blocks[k]
-                                    .attn1.to_k
-                                )
-                            )
-
-                        self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_k = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": self.pipe.unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_v.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(experts),
-                        }
-                        layers = []
-
-                        for l in range(len(experts)):
-                            layers.append(
-                                deepcopy(
-                                    experts[l]
-                                    .unet.up_blocks[i]
-                                    .attentions[j]
-                                    .transformer_blocks[k]
-                                    .attn1.to_v
-                                )
-                            )
-
-                        self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_v = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": self.pipe.unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_q.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(experts),
-                        }
-                        layers = []
-
-                        for l in range(len(experts)):
-                            layers.append(
-                                deepcopy(
-                                    experts[l]
-                                    .unet.up_blocks[i]
-                                    .attentions[j]
-                                    .transformer_blocks[k]
-                                    .attn2.to_q
-                                )
-                            )
-
-                        self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_q = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": self.pipe.unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k.weight.size()[-1],
-                            "out_dim": self.pipe.unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k.weight.size()[0],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(experts),
-                        }
-
-                        layers = []
-
-                        for l in range(len(experts)):
-                            layers.append(
-                                deepcopy(
-                                    experts[l]
-                                    .unet.up_blocks[i]
-                                    .attentions[j]
-                                    .transformer_blocks[k]
-                                    .attn2.to_k
-                                )
-                            )
-
-                        self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_k = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": self.pipe.unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v.weight.size()[-1],
-                            "out_dim": self.pipe.unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v.weight.size()[0],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": len(experts),
-                        }
-                        layers = []
-
-                        for l in range(len(experts)):
-                            layers.append(
-                                deepcopy(
-                                    experts[l]
-                                    .unet.up_blocks[i]
-                                    .attentions[j]
-                                    .transformer_blocks[k]
-                                    .attn2.to_v
-                                )
-                            )
-
-                        self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_v = SparseMoeBlock(config, layers)
+                        )
+                        transformer.attn2.to_v = SparseMoeBlock(config, layers)
 
         # Routing Weight Initialization
         if self.config.get("init", "hidden") == "hidden":
             gate_params = self.get_gate_params(experts, positive, negative)
-            for i in range(self.down_idx_start, self.down_idx_end):
-                for j in range(len(self.pipe.unet.down_blocks[i].attentions)):
-                    for k in range(
-                        len(
-                            self.pipe.unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks
-                        )
-                    ):
-                        # FF Layers
-                        if not moe_layers == "attn":
-                            self.pipe.unet.down_blocks[i].attentions[
-                                j
-                            ].transformer_blocks[k].ff.gate.weight = nn.Parameter(
-                                gate_params[f"d{i}a{j}t{k}"]
+            for i, (t, block) in self.all_blocks:
+                for j, attention in enumerate(block.attentions):
+                    for k, transformer in enumerate(attention.transformer_blocks):
+                        if moe_layers != "attn":
+                            transformer.ff.gate.weight = nn.Parameter(
+                                gate_params[f"{t}{i}a{j}t{k}"]
+                            )
+                        if moe_layers != "ff":
+                            transformer.attn1.to_q.gate.weight = nn.Parameter(
+                                gate_params[f"sattnq{t}{i}a{j}t{k}"]
+                            )
+                            transformer.attn1.to_k.gate.weight = nn.Parameter(
+                                gate_params[f"sattnk{t}{i}a{j}t{k}"]
+                            )
+                            transformer.attn1.to_v.gate.weight = nn.Parameter(
+                                gate_params[f"sattnv{t}{i}a{j}t{k}"]
                             )
 
-                        # Attns
-                        if not moe_layers == "ff":
-                            self.pipe.unet.down_blocks[i].attentions[
-                                j
-                            ].transformer_blocks[
-                                k
-                            ].attn1.to_q.gate.weight = nn.Parameter(
-                                gate_params[f"sattnqd{i}a{j}t{k}"]
+                            transformer.attn2.to_q.gate.weight = nn.Parameter(
+                                gate_params[f"cattnq{t}{i}a{j}t{k}"]
                             )
-
-                            self.pipe.unet.down_blocks[i].attentions[
-                                j
-                            ].transformer_blocks[
-                                k
-                            ].attn1.to_k.gate.weight = nn.Parameter(
-                                gate_params[f"sattnkd{i}a{j}t{k}"]
+                            transformer.attn2.to_k.gate.weight = nn.Parameter(
+                                gate_params[f"cattnk{t}{i}a{j}t{k}"]
                             )
-
-                            self.pipe.unet.down_blocks[i].attentions[
-                                j
-                            ].transformer_blocks[
-                                k
-                            ].attn1.to_v.gate.weight = nn.Parameter(
-                                gate_params[f"sattnvd{i}a{j}t{k}"]
-                            )
-
-                            self.pipe.unet.down_blocks[i].attentions[
-                                j
-                            ].transformer_blocks[
-                                k
-                            ].attn2.to_q.gate.weight = nn.Parameter(
-                                gate_params[f"cattnqd{i}a{j}t{k}"]
-                            )
-
-                            self.pipe.unet.down_blocks[i].attentions[
-                                j
-                            ].transformer_blocks[
-                                k
-                            ].attn2.to_k.gate.weight = nn.Parameter(
-                                gate_params[f"cattnkd{i}a{j}t{k}"]
-                            )
-
-                            self.pipe.unet.down_blocks[i].attentions[
-                                j
-                            ].transformer_blocks[
-                                k
-                            ].attn2.to_v.gate.weight = nn.Parameter(
-                                gate_params[f"cattnvd{i}a{j}t{k}"]
-                            )
-
-            for i in range(self.up_idx_start, self.up_idx_end):
-                for j in range(len(self.pipe.unet.up_blocks[i].attentions)):
-                    for k in range(
-                        len(
-                            self.pipe.unet.up_blocks[i].attentions[j].transformer_blocks
-                        )
-                    ):
-                        # FF Layers
-                        if not moe_layers == "attn":
-                            self.pipe.unet.up_blocks[i].attentions[
-                                j
-                            ].transformer_blocks[k].ff.gate.weight = nn.Parameter(
-                                gate_params[f"u{i}a{j}t{k}"]
-                            )
-                        if not moe_layers == "ff":
-                            self.pipe.unet.up_blocks[i].attentions[
-                                j
-                            ].transformer_blocks[
-                                k
-                            ].attn1.to_q.gate.weight = nn.Parameter(
-                                gate_params[f"sattnqu{i}a{j}t{k}"]
-                            )
-
-                            self.pipe.unet.up_blocks[i].attentions[
-                                j
-                            ].transformer_blocks[
-                                k
-                            ].attn1.to_k.gate.weight = nn.Parameter(
-                                gate_params[f"sattnku{i}a{j}t{k}"]
-                            )
-
-                            self.pipe.unet.up_blocks[i].attentions[
-                                j
-                            ].transformer_blocks[
-                                k
-                            ].attn1.to_v.gate.weight = nn.Parameter(
-                                gate_params[f"sattnvu{i}a{j}t{k}"]
-                            )
-
-                            self.pipe.unet.up_blocks[i].attentions[
-                                j
-                            ].transformer_blocks[
-                                k
-                            ].attn2.to_q.gate.weight = nn.Parameter(
-                                gate_params[f"cattnqu{i}a{j}t{k}"]
-                            )
-
-                            self.pipe.unet.up_blocks[i].attentions[
-                                j
-                            ].transformer_blocks[
-                                k
-                            ].attn2.to_k.gate.weight = nn.Parameter(
-                                gate_params[f"cattnku{i}a{j}t{k}"]
-                            )
-
-                            self.pipe.unet.up_blocks[i].attentions[
-                                j
-                            ].transformer_blocks[
-                                k
-                            ].attn2.to_v.gate.weight = nn.Parameter(
-                                gate_params[f"cattnvu{i}a{j}t{k}"]
+                            transformer.attn2.to_v.gate.weight = nn.Parameter(
+                                gate_params[f"cattnv{t}{i}a{j}t{k}"]
                             )
         self.config["num_experts"] = len(experts)
         remove_all_forward_hooks(self.pipe.unet)
         try:
             del experts
             del expert
-        except:
+        except Exception:
             pass
         # Move Model to Device
         self.pipe.to(self.device)
@@ -887,300 +689,99 @@ class SegMoEPipeline:
             memory_format=torch.channels_last,
         )
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    def __call__(self, *args: Any, **kwds: Any) -> Any:
+    def __call__(self, *args, **kwargs) -> None:
         """
         Inference the SegMoEPipeline.
 
         Calls diffusers.DiffusionPipeline forward with the keyword arguments. See https://github.com/segmind/segmoe#usage for detailed usage.
         """
-        return self.pipe(*args, **kwds)
+        output = self.pipe(*args, **kwargs)  # type: ignore
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return output
 
     def create_empty(self, path):
-        with open(f"{path}/unet/config.json") as f:
+        with open(f"{path}/unet/config.json", "r") as f:
             config = json.load(f)
         self.config = config["segmoe_config"]
-        unet = UNet2DConditionModel.from_config(config)
+        unet: UNet2DConditionModel = UNet2DConditionModel.from_config(config)  # type: ignore
         num_experts_per_tok = self.config["num_experts_per_tok"]
         num_experts = self.config["num_experts"]
         moe_layers = self.config["moe_layers"]
-        self.up_idx_start = self.config["up_idx_start"] 
+        self.up_idx_start = self.config["up_idx_start"]
         self.up_idx_end = self.config["up_idx_end"]
         self.down_idx_start = self.config["down_idx_start"]
         self.down_idx_end = self.config["down_idx_end"]
-        for i in range(self.down_idx_start, self.down_idx_end):
-            for j in range(len(unet.down_blocks[i].attentions)):
-                for k in range(
-                    len(unet.down_blocks[i].attentions[j].transformer_blocks)
-                ):
-                    if not moe_layers == "attn":
-                        config = {
-                            "hidden_size": next(
-                                unet.down_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .ff.parameters()
-                            ).size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-                        # FF Layers
-                        layers = [
-                            unet.down_blocks[i].attentions[j].transformer_blocks[k].ff
-                        ] * num_experts
-                        unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].ff = SparseMoeBlock(config, layers)
-                    if not moe_layers == "ff":
-                        ## Attns
-                        config = {
-                            "hidden_size": unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_q.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-                        layers = [
-                            unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_q
-                        ] * num_experts
-                        unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_q = SparseMoeBlock(config, layers)
 
-                        layers = [
-                            unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_k
-                        ] * num_experts
-                        unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_k = SparseMoeBlock(config, layers)
+        down_blocks = list(
+            map(
+                lambda i: unet.down_blocks[i],
+                range(self.down_idx_start, self.down_idx_end),
+            )
+        )
+        up_blocks = list(
+            map(
+                lambda i: unet.up_blocks[i],
+                range(self.up_idx_start, self.up_idx_end),
+            )
+        )
+        all_blocks = down_blocks + up_blocks
 
-                        layers = [
-                            unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_v
-                        ] * num_experts
-                        unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_v = SparseMoeBlock(config, layers)
+        config_base = {
+            "num_experts_per_tok": num_experts_per_tok,
+            "num_local_experts": num_experts,
+            "move_fn": self.move_fn,
+        }
+
+        for block in all_blocks:
+            for attention in block.attentions:
+                for transformer in attention.transformer_blocks:
+                    if moe_layers != "attn":
+                        config = {
+                            "hidden_size": next(transformer.ff.parameters()).size()[-1],
+                            **config_base,
+                        }
+                        layers = [transformer.ff] * num_experts
+                        transformer.ff = SparseMoeBlock(config, layers)
+                    if moe_layers != "ff":
+                        config = {
+                            "hidden_size": transformer.attn1.to_q.weight.size()[-1],
+                            **config_base,
+                        }
+                        layers = [transformer.attn1.to_q] * num_experts
+                        transformer.attn1.to_q = SparseMoeBlock(config, layers)
+
+                        layers = [transformer.attn1.to_k] * num_experts
+                        transformer.attn1.to_k = SparseMoeBlock(config, layers)
+
+                        layers = [transformer.attn1.to_v] * num_experts
+                        transformer.attn1.to_v = SparseMoeBlock(config, layers)
 
                         config = {
-                            "hidden_size": unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_q.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
+                            "hidden_size": transformer.attn2.to_q.weight.size()[-1],
+                            **config_base,
                         }
-
-                        layers = [
-                            unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_q
-                        ] * num_experts
-                        unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_q = SparseMoeBlock(config, layers)
+                        layers = [transformer.attn2.to_q] * num_experts
+                        transformer.attn2.to_q = SparseMoeBlock(config, layers)
 
                         config = {
-                            "hidden_size": unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                            "out_dim": unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k.weight.size()[0],
+                            "hidden_size": transformer.attn2.to_k.weight.size()[-1],
+                            "out_dim": transformer.attn2.to_k.weight.size()[0],
+                            **config_base,
                         }
-                        layers = [
-                            unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k
-                        ] * num_experts
-                        unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_k = SparseMoeBlock(config, layers)
+                        layers = [transformer.attn2.to_k] * num_experts
+                        transformer.attn2.to_k = SparseMoeBlock(config, layers)
 
                         config = {
-                            "hidden_size": unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v.weight.size()[-1],
-                            "out_dim": unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v.weight.size()[0],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
+                            "hidden_size": transformer.attn2.to_v.weight.size()[-1],
+                            "out_dim": transformer.attn2.to_v.weight.size()[0],
+                            **config_base,
                         }
-                        layers = [
-                            unet.down_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v
-                        ] * num_experts
-                        unet.down_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_v = SparseMoeBlock(config, layers)
-        for i in range(self.up_idx_start, self.up_idx_end):
-            for j in range(len(unet.up_blocks[i].attentions)):
-                for k in range(len(unet.up_blocks[i].attentions[j].transformer_blocks)):
-                    if not moe_layers == "attn":
-                        config = {
-                            "hidden_size": next(
-                                unet.up_blocks[i]
-                                .attentions[j]
-                                .transformer_blocks[k]
-                                .ff.parameters()
-                            ).size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-                        # FF Layers
-                        layers = [
-                            unet.up_blocks[i].attentions[j].transformer_blocks[k].ff
-                        ] * num_experts
-                        unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].ff = SparseMoeBlock(config, layers)
-
-                    if not moe_layers == "ff":
-                        # Attns
-                        config = {
-                            "hidden_size": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_q.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-
-                        layers = [
-                            unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_q
-                        ] * num_experts
-
-                        unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_q = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_k.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-                        layers = [
-                            unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_k
-                        ] * num_experts
-
-                        unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_k = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_v.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-                        layers = [
-                            unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn1.to_v
-                        ] * num_experts
-
-                        unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn1.to_v = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_q.weight.size()[-1],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-                        layers = [
-                            unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_q
-                        ] * num_experts
-
-                        unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_q = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k.weight.size()[-1],
-                            "out_dim": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k.weight.size()[0],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-
-                        layers = [
-                            unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_k
-                        ] * num_experts
-
-                        unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_k = SparseMoeBlock(config, layers)
-
-                        config = {
-                            "hidden_size": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v.weight.size()[-1],
-                            "out_dim": unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v.weight.size()[0],
-                            "num_experts_per_tok": num_experts_per_tok,
-                            "num_local_experts": num_experts,
-                        }
-                        layers = [
-                            unet.up_blocks[i]
-                            .attentions[j]
-                            .transformer_blocks[k]
-                            .attn2.to_v
-                        ] * num_experts
-
-                        unet.up_blocks[i].attentions[j].transformer_blocks[
-                            k
-                        ].attn2.to_v = SparseMoeBlock(config, layers)
+                        layers = [transformer.attn2.to_v] * num_experts
+                        transformer.attn2.to_v = SparseMoeBlock(config, layers)
         return unet
 
     def save_pretrained(self, path):
@@ -1203,90 +804,45 @@ class SegMoEPipeline:
         )
 
     def cast_hook(self, pipe, dicts):
-        for i in range(self.down_idx_start, self.down_idx_end):
-            for j in range(len(pipe.unet.down_blocks[i].attentions)):
-                for k in range(
-                    len(pipe.unet.down_blocks[i].attentions[j].transformer_blocks)
-                ):
-                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].ff.register_forward_hook(getActivation(dicts, f"d{i}a{j}t{k}"))
+        down_blocks = list(
+            map(
+                lambda i: (i, ("d", pipe.unet.down_blocks[i])),
+                range(self.down_idx_start, self.down_idx_end),
+            )
+        )
+        up_blocks = list(
+            map(
+                lambda i: (i, ("u", pipe.unet.up_blocks[i])),
+                range(self.up_idx_start, self.up_idx_end),
+            )
+        )
+        all_blocks = down_blocks + up_blocks
 
-                    ## Down Self Attns
-                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn1.to_q.register_forward_hook(
-                        getActivation(dicts, f"sattnqd{i}a{j}t{k}")
-                    )
-                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn1.to_k.register_forward_hook(
-                        getActivation(dicts, f"sattnkd{i}a{j}t{k}")
-                    )
-                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn1.to_v.register_forward_hook(
-                        getActivation(dicts, f"sattnvd{i}a{j}t{k}")
+        for i, (t, block) in all_blocks:
+            for j, attention in enumerate(block.attentions):
+                for k, transformer in enumerate(attention.transformer_blocks):
+                    transformer.ff.register_forward_hook(
+                        getActivation(dicts, f"{t}{i}a{j}t{k}")
                     )
 
-                    ## Down Cross Attns
-
-                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn2.to_q.register_forward_hook(
-                        getActivation(dicts, f"cattnqd{i}a{j}t{k}")
+                    transformer.attn1.to_q.register_forward_hook(
+                        getActivation(dicts, f"sattnq{t}{i}a{j}t{k}")
                     )
-                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn2.to_k.register_forward_hook(
-                        getActivation(dicts, f"cattnkd{i}a{j}t{k}")
+                    transformer.attn1.to_k.register_forward_hook(
+                        getActivation(dicts, f"sattnk{t}{i}a{j}t{k}")
                     )
-                    pipe.unet.down_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn2.to_v.register_forward_hook(
-                        getActivation(dicts, f"cattnvd{i}a{j}t{k}")
+                    transformer.attn1.to_v.register_forward_hook(
+                        getActivation(dicts, f"sattnv{t}{i}a{j}t{k}")
                     )
 
-        for i in range(self.up_idx_start, self.up_idx_end):
-            for j in range(len(pipe.unet.up_blocks[i].attentions)):
-                for k in range(
-                    len(pipe.unet.up_blocks[i].attentions[j].transformer_blocks)
-                ):
-                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].ff.register_forward_hook(getActivation(dicts, f"u{i}a{j}t{k}"))
-                    ## Up Self Attns
-                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn1.to_q.register_forward_hook(
-                        getActivation(dicts, f"sattnqu{i}a{j}t{k}")
+                    transformer.attn2.to_q.register_forward_hook(
+                        getActivation(dicts, f"cattnq{t}{i}a{j}t{k}")
                     )
-                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn1.to_k.register_forward_hook(
-                        getActivation(dicts, f"sattnku{i}a{j}t{k}")
+                    transformer.attn2.to_k.register_forward_hook(
+                        getActivation(dicts, f"cattnk{t}{i}a{j}t{k}")
                     )
-                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn1.to_v.register_forward_hook(
-                        getActivation(dicts, f"sattnvu{i}a{j}t{k}")
-                    )
-
-                    ## Up Cross Attns
-                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn2.to_q.register_forward_hook(
-                        getActivation(dicts, f"cattnqu{i}a{j}t{k}")
-                    )
-                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn2.to_k.register_forward_hook(
-                        getActivation(dicts, f"cattnku{i}a{j}t{k}")
-                    )
-                    pipe.unet.up_blocks[i].attentions[j].transformer_blocks[
-                        k
-                    ].attn2.to_v.register_forward_hook(
-                        getActivation(dicts, f"cattnvu{i}a{j}t{k}")
+                    transformer.attn2.to_v.register_forward_hook(
+                        getActivation(dicts, f"cattnv{t}{i}a{j}t{k}")
                     )
 
     @torch.no_grad
@@ -1307,7 +863,8 @@ class SegMoEPipeline:
             hidden[key] = hidden_states.to(self.device)
         del intermediate
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return hidden
 
     @torch.no_grad
@@ -1318,6 +875,7 @@ class SegMoEPipeline:
         negative,
     ):
         gate_vects = {}
+        hidden_states = []
         for i, expert in enumerate(tqdm.tqdm(experts, desc="Expert Prompts")):
             expert.to(self.device)
             expert.unet.to(
@@ -1328,7 +886,8 @@ class SegMoEPipeline:
             hidden_states = self.get_hidden_states(expert, positive[i], negative[i])
             del expert
             gc.collect()
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             for h in hidden_states:
                 if i == 0:
                     gate_vects[h] = []
@@ -1341,5 +900,6 @@ class SegMoEPipeline:
                 gate_vects[h], dim=0
             )  # (num_expert, num_layer, hidden_size)
             gate_vects[h].permute(1, 0)
-
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return gate_vects
